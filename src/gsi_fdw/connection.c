@@ -514,7 +514,7 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 
 		/* Use "postgres_fdw" as fallback_application_name */
 		keywords[n] = "fallback_application_name";
-		values[n] = "postgres_fdw";
+		values[n] = "gsi_fdw";
 		n++;
 
 		/* Set client_encoding so that libpq can convert encoding properly. */

@@ -1,0 +1,50 @@
+# 1 coordinator + 5 data nodes; each data node holds one base partition
+# and one index partition.  NNODES=2..5 uses only shard1..shardN (the
+# others idle); changing it needs `docker compose down -v`.
+x-node: &node
+  image: gsi-pg:16
+  build: { context: .., dockerfile: docker/Dockerfile }
+  environment:
+    POSTGRES_HOST_AUTH_METHOD: trust
+  healthcheck:
+    test: ["CMD", "pg_isready", "-U", "postgres"]
+    interval: 2s
+    retries: 30
+
+x-shard: &shard
+  <<: *node
+  volumes: ["./init/datanode.sql:/docker-entrypoint-initdb.d/init.sql:ro"]
+
+services:
+  shard1:
+    <<: *shard
+    ports: ["5433:5432"]
+  shard2:
+    <<: *shard
+    ports: ["5434:5432"]
+    depends_on: [shard1]
+  shard3:
+    <<: *shard
+    ports: ["5435:5432"]
+    depends_on: [shard1]
+  shard4:
+    <<: *shard
+    ports: ["5436:5432"]
+    depends_on: [shard1]
+  shard5:
+    <<: *shard
+    ports: ["5437:5432"]
+    depends_on: [shard1]
+  coordinator:
+    <<: *node
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+      NNODES: ${NNODES:-5}
+    ports: ["5432:5432"]
+    volumes: ["./init/coordinator.sh:/docker-entrypoint-initdb.d/init.sh:ro"]
+    depends_on:
+      shard1: { condition: service_healthy }
+      shard2: { condition: service_healthy }
+      shard3: { condition: service_healthy }
+      shard4: { condition: service_healthy }
+      shard5: { condition: service_healthy }
