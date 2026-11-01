@@ -5,6 +5,7 @@ OBJS = \
 	$(WIN32RES) \
 	connection.o \
 	deparse.o \
+	gsi.o \
 	option.o \
 	postgres_fdw.o \
 	shippable.o

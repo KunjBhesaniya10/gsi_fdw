@@ -10,6 +10,7 @@ N=${NNODES:-5}
         echo "CREATE SERVER shard$i FOREIGN DATA WRAPPER gsi_fdw
                   OPTIONS (host 'shard$i', port '5432', dbname 'postgres');"
         echo "CREATE USER MAPPING FOR PUBLIC SERVER shard$i OPTIONS (user 'postgres');"
+        echo "INSERT INTO gsi.gsi_node VALUES ($((i - 1)), 'shard$i');"
     done
     cat <<'SQL'
 -- Foreign partitions can't carry a PK; each shard's PK enforces id uniqueness.

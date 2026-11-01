@@ -20,6 +20,7 @@
 #include "commands/extension.h"
 #include "libpq/libpq-be.h"
 #include "postgres_fdw.h"
+#include "gsi.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/varlena.h"
@@ -587,4 +588,6 @@ _PG_init(void)
 							   NULL);
 
 	MarkGUCPrefixReserved("gsi_fdw");
+
+	gsi_init();
 }
