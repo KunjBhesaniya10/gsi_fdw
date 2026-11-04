@@ -5,6 +5,9 @@
  *
  * A GSI on column c of a hash-partitioned table stores one entry
  * (key, id, shard) per row in table gsi_<index> on node hash(key) mod N.
+ * Index writes run on postgres_fdw connections inside the remote
+ * transactions, and any transaction that wrote a GSI table commits all
+ * remote transactions with two-phase commit (see connection.c).
  *
  *-------------------------------------------------------------------------
  */
@@ -70,11 +73,21 @@ extern List *gsi_begin_modify(Relation rel, CmdType operation,
 extern void gsi_capture_row(List *states, CmdType operation,
 							TupleTableSlot *slot, TupleTableSlot *planSlot);
 extern void gsi_apply_row(List *states);
+extern void gsi_fail_point(const char *name);
 extern GsiIndex *gsi_index_on_column(List *indexes, const char *col);
 extern void gsi_exec_on_all_nodes(GsiIndex *idx, const char *sql);
 extern void gsi_drop_index(GsiIndex *idx);
 
+/* gsi_resolver.c */
+extern int	gsi_resolve_all(int grace_secs);
+extern void gsi_resolver_init(void);
+
 /* gsi_scan.c */
 extern void gsi_scan_init(void);
+
+/* connection.c */
+extern void gsi_mark_conn(PGconn *conn, bool is_index);
+extern PGconn *gsi_connect_raw(ForeignServer *server, UserMapping *user);
+extern void gsi_disconnect_raw(PGconn *conn);
 
 #endif							/* GSI_H */

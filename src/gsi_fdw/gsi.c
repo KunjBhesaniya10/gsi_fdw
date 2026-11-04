@@ -36,6 +36,7 @@
 #include "utils/typcache.h"
 
 int			gsi_remote_lock_timeout = 5000;
+static char *gsi_fail_point_name = NULL;
 
 PG_FUNCTION_INFO_V1(gsi_create);
 PG_FUNCTION_INFO_V1(gsi_drop);
@@ -53,8 +54,33 @@ gsi_init(void)
 							GUC_UNIT_MS,
 							NULL, NULL, NULL);
 
+	DefineCustomStringVariable("gsi.fail_point",
+							   "Crashes the backend at the named commit step (testing only).",
+							   NULL,
+							   &gsi_fail_point_name,
+							   "",
+							   PGC_SUSET,
+							   0,
+							   NULL, NULL, NULL);
+
+	gsi_resolver_init();
 	gsi_scan_init();
 	MarkGUCPrefixReserved("gsi");
+}
+
+/*
+ * Simulate a crash at a commit step.  abort() makes the postmaster run crash
+ * recovery, exactly like a real backend crash.
+ */
+void
+gsi_fail_point(const char *name)
+{
+	if (gsi_fail_point_name && strcmp(gsi_fail_point_name, name) == 0)
+	{
+		ereport(LOG,
+				(errmsg("gsi fail point \"%s\" reached, aborting process", name)));
+		abort();
+	}
 }
 
 /* Server OIDs of all nodes, ordered by node id. Caller must be in SPI. */
@@ -407,6 +433,8 @@ send_index_op(GsiModifyState *gs, int node, const char *key, int64 id,
 	char	   *sql;
 	PGresult   *res;
 
+	gsi_mark_conn(conn, true);
+
 	values[0] = key;
 	values[1] = psprintf(INT64_FORMAT, id);
 	values[2] = psprintf("%d", gs->base_node);
@@ -466,6 +494,7 @@ gsi_exec_on_all_nodes(GsiIndex *idx, const char *sql)
 
 		conn = GetConnection(GetUserMapping(GetUserId(), idx->servers[i]),
 							 false, NULL);
+		gsi_mark_conn(conn, true);
 		do_sql_command(conn, sql);
 	}
 }

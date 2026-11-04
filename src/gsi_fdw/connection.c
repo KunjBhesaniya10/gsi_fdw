@@ -14,6 +14,7 @@
 
 #include "access/htup_details.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/pg_user_mapping.h"
 #include "commands/defrem.h"
 #include "funcapi.h"
@@ -23,6 +24,7 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "replication/message.h"
 #include "postgres_fdw.h"
 #include "storage/fd.h"
 #include "storage/latch.h"
@@ -70,6 +72,10 @@ typedef struct ConnCacheEntry
 	uint32		server_hashvalue;	/* hash value of foreign server OID */
 	uint32		mapping_hashvalue;	/* hash value of user mapping OID */
 	PgFdwConnState state;		/* extra per-connection state */
+	/* GSI two-phase commit state, valid only within one transaction */
+	bool		gsi_index;		/* an index statement ran on this conn */
+	bool		gsi_prepared;	/* PREPARE TRANSACTION succeeded */
+	char		gsi_gid[GIDSIZE];
 } ConnCacheEntry;
 
 /*
@@ -83,6 +89,9 @@ static unsigned int prep_stmt_number = 0;
 
 /* tracks whether any work is needed in callback functions */
 static bool xact_got_connection = false;
+
+/* true if this transaction wrote a GSI table; commit then uses 2PC */
+static bool gsi_xact_2pc = false;
 
 /*
  * Milliseconds to wait to cancel an in-progress query or execute a cleanup
@@ -155,6 +164,9 @@ static void pgfdw_security_check(const char **keywords, const char **values,
 								 UserMapping *user, PGconn *conn);
 static bool UserMappingPasswordRequired(UserMapping *user);
 static bool disconnect_cached_connections(Oid serverid);
+static void gsi_log_xid(void);
+static void gsi_prepare_remote_xact(ConnCacheEntry *entry);
+static void gsi_finish_prepared(bool commit);
 
 /*
  * Get a PGconn which can be used to execute queries on the remote PostgreSQL
@@ -350,6 +362,8 @@ make_new_connection(ConnCacheEntry *entry, UserMapping *user)
 		GetSysCacheHashValue1(USERMAPPINGOID,
 							  ObjectIdGetDatum(user->umid));
 	memset(&entry->state, 0, sizeof(entry->state));
+	entry->gsi_index = false;
+	entry->gsi_prepared = false;
 
 	/*
 	 * Determine whether to keep the connection that we're about to make here
@@ -984,9 +998,21 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 	List	   *pending_entries = NIL;
 	List	   *cancel_requested = NIL;
 
+	/* Second phase of 2PC: finish what pre-commit prepared */
+	if (gsi_xact_2pc)
+	{
+		if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_PARALLEL_COMMIT)
+			gsi_finish_prepared(true);
+		else if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
+			gsi_finish_prepared(false);
+	}
+
 	/* Quick exit if no connections were touched in this transaction. */
 	if (!xact_got_connection)
 		return;
+
+	if (gsi_xact_2pc && event == XACT_EVENT_PRE_COMMIT)
+		gsi_log_xid();
 
 	/*
 	 * Scan all connection cache entries to find open remote transactions, and
@@ -1018,15 +1044,21 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 					 */
 					pgfdw_reject_incomplete_xact_state_change(entry);
 
-					/* Commit all remote transactions during pre-commit */
+					/*
+					 * Commit all remote transactions during pre-commit, or
+					 * prepare them if this is a GSI transaction.
+					 */
 					entry->changing_xact_state = true;
-					if (entry->parallel_commit)
+					if (gsi_xact_2pc)
+						gsi_prepare_remote_xact(entry);
+					else if (entry->parallel_commit)
 					{
 						do_sql_command_begin(entry->conn, "COMMIT TRANSACTION");
 						pending_entries = lappend(pending_entries, entry);
 						continue;
 					}
-					do_sql_command(entry->conn, "COMMIT TRANSACTION");
+					else
+						do_sql_command(entry->conn, "COMMIT TRANSACTION");
 					entry->changing_xact_state = false;
 
 					/*
@@ -1110,6 +1142,9 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 									   true);
 		}
 	}
+
+	if (gsi_xact_2pc && event == XACT_EVENT_PRE_COMMIT)
+		gsi_fail_point("after_prepare");
 
 	/*
 	 * Regardless of the event type, we can now mark ourselves as out of the
@@ -2238,4 +2273,136 @@ disconnect_cached_connections(Oid serverid)
 	}
 
 	return result;
+}
+
+/*
+ * GSI two-phase commit
+ *
+ * Pre-commit first makes fxid durable on the coordinator, then sends PREPARE
+ * TRANSACTION 'gsi_<fxid>_<server>_<i|b>' to every participant; any failure
+ * aborts the whole transaction.  The coordinator's
+ * local commit record for fxid is the decision.  After it, COMMIT PREPARED
+ * goes to index participants ('i') before base-only ones ('b'), so a visible
+ * base row always has a visible index entry.  Nothing may throw ERROR once
+ * the decision is made; leftovers are finished by gsi_resolve().
+ */
+
+/* Note that this connection is part of a GSI write. */
+void
+gsi_mark_conn(PGconn *conn, bool is_index)
+{
+	HASH_SEQ_STATUS scan;
+	ConnCacheEntry *entry;
+
+	gsi_xact_2pc = true;
+	if (!is_index)
+		return;
+
+	hash_seq_init(&scan, ConnectionHash);
+	while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
+	{
+		if (entry->conn == conn)
+		{
+			entry->gsi_index = true;
+			hash_seq_term(&scan);
+			break;
+		}
+	}
+}
+
+/*
+ * A transaction that only wrote remotely has no WAL record carrying its xid,
+ * so after a crash the xid could be handed out again and a later commit
+ * would be misread as this transaction's decision.  Log and flush one before
+ * anything is prepared; recovery then treats the xid as aborted.
+ */
+static void
+gsi_log_xid(void)
+{
+	(void) GetTopFullTransactionId();
+	XLogFlush(LogLogicalMessage("gsi", "", 0, true));
+}
+
+static void
+gsi_prepare_remote_xact(ConnCacheEntry *entry)
+{
+	char		sql[GIDSIZE + 32];
+	PGresult   *res;
+
+	snprintf(entry->gsi_gid, GIDSIZE, "gsi_" UINT64_FORMAT "_%s_%c",
+			 U64FromFullTransactionId(GetTopFullTransactionId()),
+			 GetForeignServer(entry->serverid)->servername,
+			 entry->gsi_index ? 'i' : 'b');
+	snprintf(sql, sizeof(sql), "PREPARE TRANSACTION '%s'", entry->gsi_gid);
+
+	/* An aborted remote xact answers PREPARE with ROLLBACK; treat as failure */
+	res = pgfdw_exec_query(entry->conn, sql, NULL);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pgfdw_report_error(ERROR, res, entry->conn, true, sql);
+	if (strcmp(PQcmdStatus(res), "PREPARE TRANSACTION") != 0)
+	{
+		PQclear(res);
+		ereport(ERROR,
+				(errcode(ERRCODE_TRANSACTION_ROLLBACK),
+				 errmsg("remote transaction on server \"%s\" was rolled back",
+						GetForeignServer(entry->serverid)->servername)));
+	}
+	PQclear(res);
+	entry->gsi_prepared = true;
+}
+
+static void
+gsi_finish_prepared(bool commit)
+{
+	HASH_SEQ_STATUS scan;
+	ConnCacheEntry *entry;
+	char		sql[GIDSIZE + 32];
+
+	if (commit)
+		gsi_fail_point("after_local_commit");
+
+	/* pass 0: index participants, pass 1: base-only participants */
+	for (int pass = 0; pass < 2; pass++)
+	{
+		hash_seq_init(&scan, ConnectionHash);
+		while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
+		{
+			if (!entry->gsi_prepared || entry->conn == NULL ||
+				entry->gsi_index != (pass == 0))
+				continue;
+
+			snprintf(sql, sizeof(sql), "%s PREPARED '%s'",
+					 commit ? "COMMIT" : "ROLLBACK", entry->gsi_gid);
+			if (!pgfdw_exec_cleanup_query(entry->conn, sql, false))
+			{
+				ereport(WARNING,
+						(errmsg("could not finish prepared transaction \"%s\", left for gsi_resolve()",
+								entry->gsi_gid)));
+				disconnect_pg_server(entry);
+			}
+		}
+		if (commit && pass == 0)
+			gsi_fail_point("mid_commit_prepared");
+	}
+
+	hash_seq_init(&scan, ConnectionHash);
+	while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
+	{
+		entry->gsi_index = false;
+		entry->gsi_prepared = false;
+	}
+	gsi_xact_2pc = false;
+}
+
+/* Connection outside the cache and any transaction, for the resolver. */
+PGconn *
+gsi_connect_raw(ForeignServer *server, UserMapping *user)
+{
+	return connect_pg_server(server, user);
+}
+
+void
+gsi_disconnect_raw(PGconn *conn)
+{
+	libpqsrv_disconnect(conn);
 }
