@@ -17,6 +17,7 @@
 #include "catalog/pg_user_mapping.h"
 #include "commands/defrem.h"
 #include "funcapi.h"
+#include "gsi.h"
 #include "libpq/libpq-be.h"
 #include "libpq/libpq-be-fe-helpers.h"
 #include "mb/pg_wchar.h"
@@ -678,6 +679,15 @@ configure_remote_session(PGconn *conn)
 		do_sql_command(conn, "SET extra_float_digits = 3");
 	else
 		do_sql_command(conn, "SET extra_float_digits = 2");
+
+	/* Nodes can't see each other's lock waits; time out instead */
+	if (gsi_remote_lock_timeout > 0)
+	{
+		char		sql[64];
+
+		snprintf(sql, sizeof(sql), "SET lock_timeout = %d", gsi_remote_lock_timeout);
+		do_sql_command(conn, sql);
+	}
 }
 
 /*

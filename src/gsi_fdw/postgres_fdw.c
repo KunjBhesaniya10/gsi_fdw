@@ -41,6 +41,7 @@
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "postgres_fdw.h"
+#include "gsi.h"
 #include "storage/latch.h"
 #include "utils/builtins.h"
 #include "utils/float.h"
@@ -211,6 +212,8 @@ typedef struct PgFdwModifyState
 	/* for update row movement if subplan result rel */
 	struct PgFdwModifyState *aux_fmstate;	/* foreign-insert state, if
 											 * created */
+
+	List	   *gsi;			/* GsiModifyState per GSI, or NIL */
 } PgFdwModifyState;
 
 /*
@@ -1740,6 +1743,7 @@ postgresAddForeignUpdateTargets(PlannerInfo *root,
 								Relation target_relation)
 {
 	Var		   *var;
+	List	   *indexes;
 
 	/*
 	 * In postgres_fdw, what we need is the ctid, same as for a regular table.
@@ -1755,6 +1759,11 @@ postgresAddForeignUpdateTargets(PlannerInfo *root,
 
 	/* Register it as a row-identity column needed by this target rel */
 	add_row_identity_var(root, var, rtindex, "ctid");
+
+	/* GSI maintenance also needs the old keys and id */
+	indexes = gsi_indexes_for_rel(RelationGetRelid(target_relation));
+	if (indexes != NIL)
+		gsi_add_update_targets(root, rtindex, target_relation, indexes);
 }
 
 /*
@@ -2034,6 +2043,11 @@ postgresGetForeignModifyBatchSize(ResultRelInfo *resultRelInfo)
 	 * postgresBeginForeignInsert() currently rejects such insert attempts.
 	 */
 	Assert(fmstate == NULL || fmstate->aux_fmstate == NULL);
+
+	/* GSI maintenance runs per row */
+	if (fmstate ? fmstate->gsi != NIL :
+		gsi_indexes_for_rel(RelationGetRelid(resultRelInfo->ri_RelationDesc)) != NIL)
+		return 1;
 
 	/*
 	 * In EXPLAIN without ANALYZE, ri_FdwState is NULL, so we have to lookup
@@ -2461,6 +2475,10 @@ postgresPlanDirectModify(PlannerInfo *root,
 	 * The table modification must be an UPDATE or DELETE.
 	 */
 	if (operation != CMD_UPDATE && operation != CMD_DELETE)
+		return false;
+
+	/* A direct modify would bypass per-row GSI maintenance */
+	if (!gsi_direct_modify_ok(root, resultRelation, operation))
 		return false;
 
 	/*
@@ -4082,6 +4100,8 @@ create_foreign_modify(EState *estate,
 	/* Initialize auxiliary state */
 	fmstate->aux_fmstate = NULL;
 
+	fmstate->gsi = gsi_begin_modify(rel, operation, subplan, target_attrs);
+
 	return fmstate;
 }
 
@@ -4161,6 +4181,12 @@ execute_foreign_modify(EState *estate,
 	/* Convert parameters needed by prepared statement to text form */
 	p_values = convert_prep_stmt_params(fmstate, ctid, slots, *numSlots);
 
+	if (fmstate->gsi)
+	{
+		Assert(*numSlots == 1);
+		gsi_capture_row(fmstate->gsi, operation, slots[0], planSlots[0]);
+	}
+
 	/*
 	 * Execute the prepared statement.
 	 */
@@ -4199,6 +4225,9 @@ execute_foreign_modify(EState *estate,
 	PQclear(res);
 
 	MemoryContextReset(fmstate->temp_cxt);
+
+	if (fmstate->gsi && n_rows > 0)
+		gsi_apply_row(fmstate->gsi);
 
 	*numSlots = n_rows;
 

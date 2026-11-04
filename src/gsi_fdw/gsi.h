@@ -30,12 +30,46 @@ typedef struct GsiIndex
 	Oid		   *servers;		/* foreign server of each node id */
 } GsiIndex;
 
+/*
+ * Per-partition write state for one GSI, built by create_foreign_modify.
+ * A table with several GSIs gets a List of these.
+ */
+typedef struct GsiModifyState
+{
+	GsiIndex   *idx;
+	int			base_node;		/* node id of this partition's server */
+	AttrNumber	key_attno;		/* indexed column, partition numbering */
+	AttrNumber	id_attno;
+	AttrNumber	old_key_junk;	/* junk columns in planSlot (UPDATE/DELETE) */
+	AttrNumber	old_id_junk;
+	bool		key_updated;	/* UPDATE assigns the indexed column */
+	FmgrInfo	key_out;
+
+	/* current row, captured before the base write */
+	char	   *old_key;		/* NULL if no entry to delete */
+	char	   *new_key;		/* NULL if no entry to insert */
+	int			old_node;
+	int			new_node;
+	int64		old_id;
+	int64		new_id;
+} GsiModifyState;
+
 /* gsi.c */
+extern int	gsi_remote_lock_timeout;
 extern void gsi_init(void);
 extern Oid *gsi_load_nodes(int *nnodes, MemoryContext cxt);
 extern List *gsi_indexes_for_rel(Oid relid);
 extern int	gsi_node_for_datum(Datum value, Oid typid, Oid collid, int nnodes);
 extern int	gsi_server_node(GsiIndex *idx, Oid serverid);
+extern void gsi_add_update_targets(PlannerInfo *root, Index rtindex,
+								   Relation rel, List *indexes);
+extern bool gsi_direct_modify_ok(PlannerInfo *root, Index rtindex,
+								 CmdType operation);
+extern List *gsi_begin_modify(Relation rel, CmdType operation,
+							  Plan *subplan, List *target_attrs);
+extern void gsi_capture_row(List *states, CmdType operation,
+							TupleTableSlot *slot, TupleTableSlot *planSlot);
+extern void gsi_apply_row(List *states);
 extern GsiIndex *gsi_index_on_column(List *indexes, const char *col);
 extern void gsi_exec_on_all_nodes(GsiIndex *idx, const char *sql);
 extern void gsi_drop_index(GsiIndex *idx);

@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * gsi.c
- *		  GSI catalog access and placement
+ *		  GSI catalog access, placement, and synchronous index maintenance
  *
  * Catalog tables live in schema gsi on the coordinator:
  *	gsi.gsi_node(node_id, server_name)	maps node ids 0..N-1 to servers
@@ -18,9 +18,13 @@
 #include "catalog/namespace.h"
 #include "catalog/partition.h"
 #include "catalog/pg_type.h"
+#include "executor/executor.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
+#include "optimizer/appendinfo.h"
+#include "parser/parsetree.h"
 #include "partitioning/partbounds.h"
 #include "postgres_fdw.h"
 #include "gsi.h"
@@ -31,6 +35,8 @@
 #include "utils/rel.h"
 #include "utils/typcache.h"
 
+int			gsi_remote_lock_timeout = 5000;
+
 PG_FUNCTION_INFO_V1(gsi_create);
 PG_FUNCTION_INFO_V1(gsi_drop);
 PG_FUNCTION_INFO_V1(gsi_node_for);
@@ -38,6 +44,15 @@ PG_FUNCTION_INFO_V1(gsi_node_for);
 void
 gsi_init(void)
 {
+	DefineCustomIntVariable("gsi.remote_lock_timeout",
+							"Sets lock_timeout on remote sessions; bounds cross-node deadlocks.",
+							NULL,
+							&gsi_remote_lock_timeout,
+							5000, 0, INT_MAX,
+							PGC_USERSET,
+							GUC_UNIT_MS,
+							NULL, NULL, NULL);
+
 	gsi_scan_init();
 	MarkGUCPrefixReserved("gsi");
 }
@@ -177,6 +192,268 @@ gsi_server_node(GsiIndex *idx, Oid serverid)
 			return i;
 	elog(ERROR, "foreign server %u is not listed in gsi.gsi_node", serverid);
 	return -1;					/* keep compiler quiet */
+}
+
+static void
+add_junk_column(PlannerInfo *root, Index rtindex, Relation rel,
+				const char *colname, const char *junkname)
+{
+	AttrNumber	attnum = get_attnum(RelationGetRelid(rel), colname);
+	Form_pg_attribute attr;
+
+	if (attnum == InvalidAttrNumber)
+		elog(ERROR, "column \"%s\" not found in \"%s\"",
+			 colname, RelationGetRelationName(rel));
+	attr = TupleDescAttr(RelationGetDescr(rel), attnum - 1);
+	add_row_identity_var(root,
+						 makeVar(rtindex, attnum, attr->atttypid, attr->atttypmod,
+								 attr->attcollation, 0),
+						 rtindex, junkname);
+}
+
+/* Junk column holding one GSI's old key */
+static char *
+old_key_junk_name(GsiIndex *idx)
+{
+	return psprintf("gsi_old_key_%s", idx->name);
+}
+
+/*
+ * UPDATE/DELETE fetch the old key of every GSI and the old id, so the old
+ * entries can be removed.
+ */
+void
+gsi_add_update_targets(PlannerInfo *root, Index rtindex, Relation rel,
+					   List *indexes)
+{
+	ListCell   *lc;
+
+	foreach(lc, indexes)
+	{
+		GsiIndex   *idx = lfirst(lc);
+
+		add_junk_column(root, rtindex, rel, idx->column, old_key_junk_name(idx));
+	}
+	add_junk_column(root, rtindex, rel, "id", "gsi_old_id");
+}
+
+/*
+ * May postgres_fdw push this UPDATE/DELETE down as one remote statement?
+ * Only if it can't change an index entry: the table has no GSI, or it's an
+ * UPDATE that sets no indexed column and not id.  Otherwise the per-row
+ * path must run so the indexes are maintained.
+ */
+bool
+gsi_direct_modify_ok(PlannerInfo *root, Index rtindex, CmdType operation)
+{
+	Oid			relid = planner_rt_fetch(rtindex, root)->relid;
+	List	   *indexes = gsi_indexes_for_rel(relid);
+	List	   *tlist = NIL;
+	List	   *update_attrs = NIL;
+	ListCell   *lc;
+
+	if (indexes == NIL)
+		return true;
+	if (operation != CMD_UPDATE)
+		return false;
+	get_translated_update_targetlist(root, rtindex, &tlist, &update_attrs);
+	if (list_member_int(update_attrs, get_attnum(relid, "id")))
+		return false;
+	foreach(lc, indexes)
+	{
+		GsiIndex   *idx = lfirst(lc);
+
+		if (list_member_int(update_attrs, get_attnum(relid, idx->column)))
+			return false;
+	}
+	return true;
+}
+
+/* Write state for every GSI on rel, or NIL if it has none. */
+List *
+gsi_begin_modify(Relation rel, CmdType operation, Plan *subplan,
+				 List *target_attrs)
+{
+	Oid			relid = RelationGetRelid(rel);
+	List	   *indexes = gsi_indexes_for_rel(relid);
+	List	   *states = NIL;
+	AttrNumber	id_attno = get_attnum(relid, "id");
+	AttrNumber	old_id_junk = InvalidAttrNumber;
+	ListCell   *lc;
+
+	if (indexes == NIL)
+		return NIL;
+
+	if (operation == CMD_UPDATE || operation == CMD_DELETE)
+	{
+		old_id_junk = ExecFindJunkAttributeInTlist(subplan->targetlist,
+												   "gsi_old_id");
+		if (!AttributeNumberIsValid(old_id_junk))
+			elog(ERROR, "could not find GSI junk column \"gsi_old_id\"");
+	}
+
+	/* foreign partitions don't move rows, so a new id could land on the wrong shard */
+	if (operation == CMD_UPDATE && list_member_int(target_attrs, id_attno))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot update column \"id\" of a table with a GSI")));
+
+	foreach(lc, indexes)
+	{
+		GsiIndex   *idx = lfirst(lc);
+		GsiModifyState *gs = palloc0(sizeof(GsiModifyState));
+		Oid			typoutput;
+		bool		typisvarlena;
+
+		gs->idx = idx;
+		gs->base_node = gsi_server_node(idx, GetForeignTable(relid)->serverid);
+		gs->key_attno = get_attnum(relid, idx->column);
+		gs->id_attno = id_attno;
+		gs->old_id_junk = old_id_junk;
+		getTypeOutputInfo(idx->typid, &typoutput, &typisvarlena);
+		fmgr_info(typoutput, &gs->key_out);
+
+		if (operation == CMD_UPDATE || operation == CMD_DELETE)
+		{
+			gs->old_key_junk = ExecFindJunkAttributeInTlist(subplan->targetlist,
+															old_key_junk_name(idx));
+			if (!AttributeNumberIsValid(gs->old_key_junk))
+				elog(ERROR, "could not find GSI junk column for \"%s\"", idx->name);
+		}
+		if (operation == CMD_UPDATE)
+			gs->key_updated = list_member_int(target_attrs, gs->key_attno);
+		states = lappend(states, gs);
+	}
+
+	return states;
+}
+
+static char *
+key_text(GsiModifyState *gs, Datum value, int *node)
+{
+	*node = gsi_node_for_datum(value, gs->idx->typid, gs->idx->collid,
+							   gs->idx->nnodes);
+	return OutputFunctionCall(&gs->key_out, value);
+}
+
+/*
+ * Record one GSI's entries to delete/insert for one row.  Done before the
+ * base write because RETURNING replaces the slot contents.  For UPDATE the
+ * slot holds only assigned columns, so unassigned ones come from the junk
+ * (old) values.
+ */
+static void
+capture_one(GsiModifyState *gs, CmdType operation,
+			TupleTableSlot *slot, TupleTableSlot *planSlot)
+{
+	Datum		d;
+	bool		isnull;
+
+	gs->old_key = gs->new_key = NULL;
+
+	if (operation != CMD_INSERT)
+	{
+		d = ExecGetJunkAttribute(planSlot, gs->old_key_junk, &isnull);
+		if (!isnull)
+			gs->old_key = key_text(gs, d, &gs->old_node);
+		gs->old_id = DatumGetInt64(ExecGetJunkAttribute(planSlot, gs->old_id_junk,
+														&isnull));
+	}
+	if (operation == CMD_DELETE)
+		return;
+
+	if (operation == CMD_INSERT || gs->key_updated)
+	{
+		d = slot_getattr(slot, gs->key_attno, &isnull);
+		if (!isnull)
+			gs->new_key = key_text(gs, d, &gs->new_node);
+	}
+	else if (gs->old_key)
+	{
+		gs->new_key = gs->old_key;
+		gs->new_node = gs->old_node;
+	}
+
+	if (operation == CMD_INSERT)
+		gs->new_id = DatumGetInt64(slot_getattr(slot, gs->id_attno, &isnull));
+	else
+		gs->new_id = gs->old_id;
+
+	/* UPDATE that keeps the key leaves the entry alone */
+	if (operation == CMD_UPDATE && gs->old_key && gs->new_key &&
+		strcmp(gs->old_key, gs->new_key) == 0)
+		gs->old_key = gs->new_key = NULL;
+}
+
+/* Record the entries to delete/insert in every GSI for one row. */
+void
+gsi_capture_row(List *states, CmdType operation,
+				TupleTableSlot *slot, TupleTableSlot *planSlot)
+{
+	ListCell   *lc;
+
+	foreach(lc, states)
+		capture_one(lfirst(lc), operation, slot, planSlot);
+}
+
+/* Run one index statement on the node's connection, inside its remote xact. */
+static void
+send_index_op(GsiModifyState *gs, int node, const char *key, int64 id,
+			  bool insert)
+{
+	UserMapping *user = GetUserMapping(GetUserId(), gs->idx->servers[node]);
+	PGconn	   *conn = GetConnection(user, false, NULL);
+	const char *values[3];
+	char	   *sql;
+	PGresult   *res;
+
+	values[0] = key;
+	values[1] = psprintf(INT64_FORMAT, id);
+	values[2] = psprintf("%d", gs->base_node);
+	if (insert)
+		sql = psprintf("INSERT INTO %s (key, id, shard) VALUES ($1, $2, $3)",
+					   gs->idx->remote_table);
+	else
+		sql = psprintf("DELETE FROM %s WHERE key = $1 AND id = $2",
+					   gs->idx->remote_table);
+
+	if (!PQsendQueryParams(conn, sql, insert ? 3 : 2, NULL, values,
+						   NULL, NULL, 0))
+		pgfdw_report_error(ERROR, NULL, conn, false, sql);
+	res = pgfdw_get_result(conn, sql);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pgfdw_report_error(ERROR, res, conn, true, sql);
+
+	/*
+	 * We hold the base row's lock, so its committed entry exists.  Missing it
+	 * means this node's REPEATABLE READ snapshot predates that commit.
+	 */
+	if (!insert && strcmp(PQcmdTuples(res), "1") != 0)
+	{
+		PQclear(res);
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not serialize access due to concurrent update of GSI \"%s\"",
+						gs->idx->name)));
+	}
+	PQclear(res);
+}
+
+/* Apply the captured entries of every GSI after the base write succeeded. */
+void
+gsi_apply_row(List *states)
+{
+	ListCell   *lc;
+
+	foreach(lc, states)
+	{
+		GsiModifyState *gs = lfirst(lc);
+
+		if (gs->old_key)
+			send_index_op(gs, gs->old_node, gs->old_key, gs->old_id, false);
+		if (gs->new_key)
+			send_index_op(gs, gs->new_node, gs->new_key, gs->new_id, true);
+	}
 }
 
 /* Run a DDL command on every node, as part of the distributed transaction. */
