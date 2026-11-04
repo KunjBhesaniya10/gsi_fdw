@@ -38,6 +38,7 @@ PG_FUNCTION_INFO_V1(gsi_node_for);
 void
 gsi_init(void)
 {
+	gsi_scan_init();
 	MarkGUCPrefixReserved("gsi");
 }
 

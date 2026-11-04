@@ -6,6 +6,7 @@ OBJS = \
 	connection.o \
 	deparse.o \
 	gsi.o \
+	gsi_scan.o \
 	option.o \
 	postgres_fdw.o \
 	shippable.o

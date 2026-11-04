@@ -40,4 +40,7 @@ extern GsiIndex *gsi_index_on_column(List *indexes, const char *col);
 extern void gsi_exec_on_all_nodes(GsiIndex *idx, const char *sql);
 extern void gsi_drop_index(GsiIndex *idx);
 
+/* gsi_scan.c */
+extern void gsi_scan_init(void);
+
 #endif							/* GSI_H */
