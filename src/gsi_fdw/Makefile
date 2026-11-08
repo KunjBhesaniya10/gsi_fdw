@@ -6,6 +6,7 @@ OBJS = \
 	connection.o \
 	deparse.o \
 	gsi.o \
+	gsi_async.o \
 	gsi_build.o \
 	gsi_resolver.o \
 	gsi_scan.o \

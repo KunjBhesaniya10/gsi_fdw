@@ -65,9 +65,16 @@ CREATE TABLE gsi.gsi_build_progress (
 
 -- Builds online (status write-only -> backfill -> ready); calling it again
 -- on an unfinished build resumes it.  Not inside a transaction block.
-CREATE PROCEDURE gsi_create(base regclass, col name, is_unique boolean DEFAULT false)
+CREATE PROCEDURE gsi_create(base regclass, col name, is_unique boolean DEFAULT false,
+                            mode text DEFAULT 'sync')
 AS 'MODULE_PATHNAME'
 LANGUAGE C;
+
+-- Async GSIs: outbox rows not yet applied, per node
+CREATE FUNCTION gsi_lag(OUT node int, OUT pending bigint, OUT oldest_secs float8)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
 
 -- col NULL drops every GSI of the table
 CREATE FUNCTION gsi_drop(base regclass, col name DEFAULT NULL)

@@ -451,6 +451,45 @@ validate(Oid base, const char *col, const char *name)
 }
 
 /*
+ * Async GSI: wait (up to 5 min) until the outbox holds no rows for it.  Own
+ * autocommit connections, so every look sees the applier's progress while
+ * the caller keeps its lock.
+ */
+static void
+wait_for_outbox(Oid base, const char *col, const char *name)
+{
+	GsiIndex   *idx = current_index(base, col, name);
+	const char *sql = "SELECT 1 FROM public.gsi_outbox WHERE index_name = $1 LIMIT 1";
+	const char *values[1] = {name};
+
+	for (int i = 0; i < 3000; i++)
+	{
+		bool		empty = true;
+
+		for (int node = 0; node < idx->nnodes && empty; node++)
+		{
+			PGconn	   *conn = gsi_connect_raw(GetForeignServer(idx->servers[node]),
+											   GetUserMapping(GetUserId(), idx->servers[node]));
+			PGresult   *res = PQexecParams(conn, sql, 1, NULL, values, NULL, NULL, 0);
+			bool		ok = PQresultStatus(res) == PGRES_TUPLES_OK;
+
+			empty = ok && PQntuples(res) == 0;
+			PQclear(res);
+			gsi_disconnect_raw(conn);
+			if (!ok)
+				ereport(ERROR,
+						(errmsg("gsi_create: could not read the outbox of node %d", node)));
+		}
+		if (empty)
+			return;
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(100000L);
+	}
+	ereport(ERROR,
+			(errmsg("gsi_create: outbox of \"%s\" did not drain; is the applier running?", name)));
+}
+
+/*
  * Step 1a: the index tables on every node.  Committed before the catalog row
  * exists: the coordinator commits locally before COMMIT PREPARED reaches the
  * nodes (connection.c), so in one transaction a writer could see the row and
@@ -459,7 +498,7 @@ validate(Oid base, const char *col, const char *name)
  */
 static void
 create_index_tables(Relation rel, const char *col, const char *name,
-					bool is_unique)
+					bool is_unique, bool is_async)
 {
 	MemoryContext cxt = CurrentMemoryContext;
 	GsiIndex   *idx = palloc0(sizeof(GsiIndex));
@@ -483,25 +522,32 @@ create_index_tables(Relation rel, const char *col, const char *name,
 	if (is_unique)
 		gsi_exec_on_all_nodes(idx, psprintf("CREATE UNIQUE INDEX ON %s (key)",
 											idx->remote_table));
+	if (is_async)
+		gsi_exec_on_all_nodes(idx,
+							  "CREATE TABLE IF NOT EXISTS public.gsi_outbox ("
+							  "seq bigserial PRIMARY KEY, index_name text NOT NULL, "
+							  "old_key text, new_key text, id bigint NOT NULL, "
+							  "created_at timestamptz NOT NULL DEFAULT now())");
 }
 
 /* Step 1b: the catalog row in status 'write-only'; writes maintain it from now on */
 static void
 insert_write_only(Oid base, const char *col, const char *name,
-				  bool is_unique)
+				  bool is_unique, const char *mode)
 {
-	Oid			argtypes[4] = {NAMEOID, REGCLASSOID, NAMEOID, BOOLOID};
-	Datum		args[4];
+	Oid			argtypes[5] = {NAMEOID, REGCLASSOID, NAMEOID, BOOLOID, TEXTOID};
+	Datum		args[5];
 
 	args[0] = DirectFunctionCall1(namein, CStringGetDatum(name));
 	args[1] = ObjectIdGetDatum(base);
 	args[2] = DirectFunctionCall1(namein, CStringGetDatum(col));
 	args[3] = BoolGetDatum(is_unique);
+	args[4] = CStringGetTextDatum(mode);
 	SPI_connect();
 	if (SPI_execute_with_args("INSERT INTO gsi.gsi_index "
-							  "(index_name, base_table, column_name, is_unique, status) "
-							  "VALUES ($1, $2, $3, $4, 'write-only')",
-							  4, argtypes, args, NULL, false, 0) != SPI_OK_INSERT)
+							  "(index_name, base_table, column_name, is_unique, mode, status) "
+							  "VALUES ($1, $2, $3, $4, $5, 'write-only')",
+							  5, argtypes, args, NULL, false, 0) != SPI_OK_INSERT)
 		elog(ERROR, "could not insert into gsi.gsi_index");
 	SPI_finish();
 
@@ -527,7 +573,8 @@ set_ready(const char *name)
 }
 
 /*
- * CALL gsi_create(base regclass, col name, is_unique bool DEFAULT false)
+ * CALL gsi_create(base regclass, col name, is_unique bool DEFAULT false,
+ *				   mode text DEFAULT 'sync')
  *
  * One GSI per column.  A procedure because every step must commit before
  * the next one; like CREATE INDEX CONCURRENTLY it can't run inside a
@@ -539,6 +586,7 @@ gsi_create(PG_FUNCTION_ARGS)
 	Oid			base;
 	char	   *col;
 	bool		is_unique;
+	char	   *mode;
 	char	   *name;
 	Relation	rel;
 	GsiIndex   *existing;
@@ -550,13 +598,24 @@ gsi_create(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 				 errmsg("gsi_create cannot run inside a transaction block"),
 				 errhint("Run CALL gsi_create(...) on its own.")));
-	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2) || PG_ARGISNULL(3))
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 				 errmsg("gsi_create arguments must not be NULL")));
 	base = PG_GETARG_OID(0);
 	col = pstrdup(NameStr(*PG_GETARG_NAME(1)));
 	is_unique = PG_GETARG_BOOL(2);
+	mode = text_to_cstring(PG_GETARG_TEXT_PP(3));
+
+	if (strcmp(mode, "sync") != 0 && strcmp(mode, "async") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("mode must be 'sync' or 'async'")));
+	/* an async index would see a duplicate only after both rows committed */
+	if (is_unique && strcmp(mode, "async") == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a unique GSI must be sync")));
 
 	SPI_connect_ext(SPI_OPT_NONATOMIC);
 
@@ -585,7 +644,7 @@ gsi_create(PG_FUNCTION_ARGS)
 						col, RelationGetRelationName(rel))));
 	if (existing != NULL)
 	{
-		if (existing->is_unique != is_unique)
+		if (existing->is_unique != is_unique || existing->is_async != (strcmp(mode, "async") == 0))
 			ereport(ERROR,
 					(errcode(ERRCODE_DUPLICATE_OBJECT),
 					 errmsg("an unfinished build of GSI \"%s\" with other options exists", name),
@@ -594,12 +653,12 @@ gsi_create(PG_FUNCTION_ARGS)
 	}
 	else
 	{
-		create_index_tables(rel, col, name, is_unique);
+		create_index_tables(rel, col, name, is_unique, strcmp(mode, "async") == 0);
 		table_close(rel, NoLock);
 		SPI_commit();
 		/* a build that started meanwhile fails here on the catalog's keys */
 		rel = table_open(base, ShareUpdateExclusiveLock);
-		insert_write_only(base, col, name, is_unique);
+		insert_write_only(base, col, name, is_unique, mode);
 	}
 	table_close(rel, NoLock);
 	SPI_commit();
@@ -621,6 +680,8 @@ gsi_create(PG_FUNCTION_ARGS)
 	 * wrong.  Only for the validation, a few seconds per million rows.
 	 */
 	LockRelationOid(base, ShareLock);
+	if (strcmp(mode, "async") == 0)
+		wait_for_outbox(base, col, name);
 	validate(base, col, name);
 	set_ready(name);
 	CacheInvalidateRelcacheByRelid(base);	/* cached SELECTs may use it now */

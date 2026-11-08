@@ -66,6 +66,7 @@ gsi_init(void)
 	gsi_resolver_init();
 	gsi_scan_init();
 	gsi_build_init();
+	gsi_async_init();
 	MarkGUCPrefixReserved("gsi");
 }
 
@@ -112,10 +113,10 @@ gsi_load_nodes(int *nnodes, MemoryContext cxt)
 	return servers;
 }
 
-/* GsiIndex rows: name, column, unique, ready, type, collation */
+/* GsiIndex rows: name, column, unique, ready, async, type, collation */
 #define GSI_INDEX_COLUMNS \
 	"SELECT i.index_name, i.column_name, i.is_unique, i.status = 'ready', " \
-	"a.atttypid, a.attcollation " \
+	"i.mode = 'async', a.atttypid, a.attcollation " \
 	"FROM gsi.gsi_index i JOIN pg_catalog.pg_attribute a " \
 	"ON a.attrelid = i.base_table AND a.attname = i.column_name "
 
@@ -161,8 +162,9 @@ read_indexes(const char *sql, Oid argtype, Datum arg, MemoryContext cxt)
 			idx->column = pstrdup(NameStr(*DatumGetName(SPI_getbinval(tup, desc, 2, &isnull))));
 			idx->is_unique = DatumGetBool(SPI_getbinval(tup, desc, 3, &isnull));
 			idx->is_ready = DatumGetBool(SPI_getbinval(tup, desc, 4, &isnull));
-			idx->typid = DatumGetObjectId(SPI_getbinval(tup, desc, 5, &isnull));
-			idx->collid = DatumGetObjectId(SPI_getbinval(tup, desc, 6, &isnull));
+			idx->is_async = DatumGetBool(SPI_getbinval(tup, desc, 5, &isnull));
+			idx->typid = DatumGetObjectId(SPI_getbinval(tup, desc, 6, &isnull));
+			idx->collid = DatumGetObjectId(SPI_getbinval(tup, desc, 7, &isnull));
 			idx->remote_table = psprintf("public.%s",
 										 quote_identifier(psprintf("gsi_%s", idx->name)));
 			idx->servers = servers;
@@ -176,7 +178,7 @@ read_indexes(const char *sql, Oid argtype, Datum arg, MemoryContext cxt)
 
 /*
  * Return the GSIs on relid (a partitioned table or one of its partitions),
- * any status, ordered by index name, or NIL.
+ * sync and async, any status, ordered by index name, or NIL.
  */
 List *
 gsi_indexes_for_rel(Oid relid)
@@ -197,7 +199,22 @@ gsi_indexes_for_rel(Oid relid)
 	return indexes;
 }
 
-/* Key value from its text form */
+/* The GSI named name, or NULL.  Caller is in a transaction. */
+GsiIndex *
+gsi_index_by_name(const char *name)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	List	   *indexes;
+
+	SPI_connect();
+	indexes = read_indexes(GSI_INDEX_COLUMNS "WHERE i.index_name = $1",
+						   NAMEOID, DirectFunctionCall1(namein, CStringGetDatum(name)),
+						   cxt);
+	SPI_finish();
+	return indexes ? linitial(indexes) : NULL;
+}
+
+/* Key value from its text form (as stored in the outbox) */
 Datum
 gsi_key_from_text(GsiIndex *idx, const char *text)
 {
@@ -387,6 +404,12 @@ gsi_begin_modify(Relation rel, CmdType operation, Plan *subplan,
 		states = lappend(states, gs);
 	}
 
+	/*
+	 * No coordinator xid here: only a 2PC commit needs one (its commit record
+	 * is the decision), and gsi_log_xid() assigns it at pre-commit.  A write
+	 * that only fed async GSIs on one node then commits without a local
+	 * commit record and its WAL flush.
+	 */
 	return states;
 }
 
@@ -503,6 +526,57 @@ send_index_op(GsiModifyState *gs, int node, const char *key, int64 id,
 	PQclear(res);
 }
 
+/*
+ * One outbox row on the base node, in the base write's remote transaction:
+ * the applier later deletes old_key's entry and inserts new_key's (either
+ * may be NULL).
+ */
+static void
+send_outbox_op(GsiModifyState *gs)
+{
+	UserMapping *user = GetUserMapping(GetUserId(), gs->idx->servers[gs->base_node]);
+	PGconn	   *conn = GetConnection(user, false, NULL);
+	const char *values[4];
+	const char *sql = "INSERT INTO public.gsi_outbox (index_name, old_key, new_key, id) "
+		"VALUES ($1, $2, $3, $4)";
+	PGresult   *res;
+
+	values[0] = gs->idx->name;
+	values[1] = gs->old_key;
+	values[2] = gs->new_key;
+	values[3] = psprintf(INT64_FORMAT, gs->new_key ? gs->new_id : gs->old_id);
+
+	if (!PQsendQueryParams(conn, sql, 4, NULL, values, NULL, NULL, 0))
+		pgfdw_report_error(ERROR, NULL, conn, false, sql);
+	res = pgfdw_get_result(conn, sql);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pgfdw_report_error(ERROR, res, conn, true, sql);
+	PQclear(res);
+}
+
+/*
+ * The base row is about to be written on conn.  A sync GSI needs 2PC; a
+ * write that only feeds async GSIs commits in one phase unless it ends up
+ * touching several nodes (connection.c decides at pre-commit).
+ */
+void
+gsi_note_base_write(List *states, PGconn *conn)
+{
+	ListCell   *lc;
+
+	foreach(lc, states)
+	{
+		GsiModifyState *gs = lfirst(lc);
+
+		if (!gs->idx->is_async)
+		{
+			gsi_mark_conn(conn, false);
+			return;
+		}
+	}
+	gsi_note_async_write();
+}
+
 /* Apply the captured entries of every GSI after the base write succeeded. */
 void
 gsi_apply_row(List *states)
@@ -513,6 +587,12 @@ gsi_apply_row(List *states)
 	{
 		GsiModifyState *gs = lfirst(lc);
 
+		if (gs->idx->is_async)
+		{
+			if (gs->old_key || gs->new_key)
+				send_outbox_op(gs);
+			continue;
+		}
 		if (gs->old_key)
 			send_index_op(gs, gs->old_node, gs->old_key, gs->old_id, false);
 		if (gs->new_key)
@@ -552,8 +632,8 @@ gsi_index_on_column(List *indexes, const char *col)
 }
 
 /*
- * Remove one GSI: catalog row, build progress and the index tables, all in
- * the current distributed transaction.
+ * Remove one GSI: catalog row, build progress, pending outbox rows and the
+ * index tables, all in the current distributed transaction.
  */
 void
 gsi_drop_index(GsiIndex *idx)
@@ -572,6 +652,9 @@ gsi_drop_index(GsiIndex *idx)
 	SPI_finish();
 
 	gsi_exec_on_all_nodes(idx, psprintf("DROP TABLE IF EXISTS %s", idx->remote_table));
+	if (idx->is_async)
+		gsi_exec_on_all_nodes(idx, psprintf("DELETE FROM public.gsi_outbox WHERE index_name = %s",
+											quote_literal_cstr(idx->name)));
 }
 
 /*

@@ -46,6 +46,7 @@ services:
                -c max_prepared_transactions=100
                -c synchronous_commit=on
                -c recovery_init_sync_method=syncfs
+               -c gsi.applier_workers=${NNODES:-5}
     environment:
       POSTGRES_HOST_AUTH_METHOD: trust
       NNODES: ${NNODES:-5}

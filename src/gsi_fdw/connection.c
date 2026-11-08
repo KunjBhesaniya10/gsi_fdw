@@ -93,6 +93,9 @@ static bool xact_got_connection = false;
 /* true if this transaction wrote a GSI table; commit then uses 2PC */
 static bool gsi_xact_2pc = false;
 
+/* this transaction wrote base rows of a table whose GSIs are all async */
+static bool gsi_xact_async = false;
+
 /*
  * Milliseconds to wait to cancel an in-progress query or execute a cleanup
  * query; if it takes longer than 30 seconds to do these, we assume the
@@ -165,6 +168,7 @@ static void pgfdw_security_check(const char **keywords, const char **values,
 static bool UserMappingPasswordRequired(UserMapping *user);
 static bool disconnect_cached_connections(Oid serverid);
 static void gsi_log_xid(void);
+static int	gsi_open_remote_xacts(void);
 static void gsi_prepare_remote_xact(ConnCacheEntry *entry);
 static void gsi_finish_prepared(bool commit);
 
@@ -1006,10 +1010,21 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 		else if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
 			gsi_finish_prepared(false);
 	}
+	if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_PARALLEL_COMMIT ||
+		event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
+		gsi_xact_async = false;
 
 	/* Quick exit if no connections were touched in this transaction. */
 	if (!xact_got_connection)
 		return;
+
+	/*
+	 * Writes that only fed async GSIs (base rows + outbox rows) need 2PC only
+	 * when they span several nodes; on one node a plain COMMIT is atomic.
+	 */
+	if (gsi_xact_async && !gsi_xact_2pc && event == XACT_EVENT_PRE_COMMIT &&
+		gsi_open_remote_xacts() > 1)
+		gsi_xact_2pc = true;
 
 	if (gsi_xact_2pc && event == XACT_EVENT_PRE_COMMIT)
 		gsi_log_xid();
@@ -2308,6 +2323,28 @@ gsi_mark_conn(PGconn *conn, bool is_index)
 			break;
 		}
 	}
+}
+
+/* Note a base write whose table has only async GSIs (see pgfdw_xact_callback). */
+void
+gsi_note_async_write(void)
+{
+	gsi_xact_async = true;
+}
+
+/* Number of connections with an open remote transaction */
+static int
+gsi_open_remote_xacts(void)
+{
+	HASH_SEQ_STATUS scan;
+	ConnCacheEntry *entry;
+	int			n = 0;
+
+	hash_seq_init(&scan, ConnectionHash);
+	while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
+		if (entry->conn != NULL && entry->xact_depth > 0)
+			n++;
+	return n;
 }
 
 /*
