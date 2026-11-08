@@ -62,6 +62,7 @@ typedef struct GsiModifyState
 
 /* gsi.c */
 extern int	gsi_remote_lock_timeout;
+extern bool gsi_trace;
 extern void gsi_init(void);
 extern Oid *gsi_load_nodes(int *nnodes, MemoryContext cxt);
 extern List *gsi_indexes_for_rel(Oid relid);
@@ -78,11 +79,19 @@ extern void gsi_capture_row(List *states, CmdType operation,
 extern void gsi_note_base_write(List *states, PGconn *conn);
 extern void gsi_apply_row(List *states);
 extern void gsi_fail_point(const char *name);
+extern void gsi_pause_point(const char *name);
 extern GsiIndex *gsi_index_by_name(const char *name);
 extern GsiIndex *gsi_index_on_column(List *indexes, const char *col);
 extern Datum gsi_key_from_text(GsiIndex *idx, const char *text);
 extern void gsi_exec_on_all_nodes(GsiIndex *idx, const char *sql);
 extern void gsi_drop_index(GsiIndex *idx);
+
+/* NOTICE in the client's session when gsi.trace is on (demo / debugging) */
+#define GSI_TRACE(...) \
+	do { \
+		if (gsi_trace) \
+			ereport(NOTICE, (errmsg_internal(__VA_ARGS__))); \
+	} while (0)
 
 /* gsi_build.c */
 extern void gsi_build_init(void);

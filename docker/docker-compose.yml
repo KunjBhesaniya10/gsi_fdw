@@ -6,6 +6,7 @@ x-node: &node
   build: { context: .., dockerfile: docker/Dockerfile }
   environment:
     POSTGRES_HOST_AUTH_METHOD: trust
+  cap_add: [NET_ADMIN]          # bench/net_delay.sh adds network delay with tc
   healthcheck:
     test: ["CMD", "pg_isready", "-U", "postgres"]
     interval: 2s

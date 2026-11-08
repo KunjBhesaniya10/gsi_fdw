@@ -37,7 +37,10 @@
 #include "utils/typcache.h"
 
 int			gsi_remote_lock_timeout = 5000;
+bool		gsi_trace = false;
 static char *gsi_fail_point_name = NULL;
+static char *gsi_pause_point_name = NULL;
+static int	gsi_pause_seconds = 20;
 
 PG_FUNCTION_INFO_V1(gsi_drop);
 PG_FUNCTION_INFO_V1(gsi_node_for);
@@ -63,6 +66,33 @@ gsi_init(void)
 							   0,
 							   NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("gsi.trace",
+							 "Reports each 2PC step of GSI transactions as a NOTICE.",
+							 NULL,
+							 &gsi_trace,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomStringVariable("gsi.pause_point",
+							   "Sleeps gsi.pause_seconds at the named commit step (demo only).",
+							   NULL,
+							   &gsi_pause_point_name,
+							   "",
+							   PGC_SUSET,
+							   0,
+							   NULL, NULL, NULL);
+
+	DefineCustomIntVariable("gsi.pause_seconds",
+							"Length of the gsi.pause_point sleep.",
+							NULL,
+							&gsi_pause_seconds,
+							20, 0, 3600,
+							PGC_SUSET,
+							GUC_UNIT_S,
+							NULL, NULL, NULL);
+
 	gsi_resolver_init();
 	gsi_scan_init();
 	gsi_build_init();
@@ -82,6 +112,23 @@ gsi_fail_point(const char *name)
 		ereport(LOG,
 				(errmsg("gsi fail point \"%s\" reached, aborting process", name)));
 		abort();
+	}
+}
+
+/*
+ * Stop at a commit step so a node can be killed by hand in the window.  No
+ * CHECK_FOR_INTERRUPTS: some steps run after the commit decision, where an
+ * ERROR is not allowed.
+ */
+void
+gsi_pause_point(const char *name)
+{
+	if (gsi_pause_point_name && strcmp(gsi_pause_point_name, name) == 0)
+	{
+		ereport(NOTICE,
+				(errmsg("gsi: paused at \"%s\" for %d s", name, gsi_pause_seconds)));
+		pg_usleep((long) gsi_pause_seconds * 1000000L);
+		ereport(NOTICE, (errmsg("gsi: resuming after \"%s\"", name)));
 	}
 }
 
