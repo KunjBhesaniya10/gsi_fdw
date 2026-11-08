@@ -75,8 +75,12 @@ extern void gsi_capture_row(List *states, CmdType operation,
 extern void gsi_apply_row(List *states);
 extern void gsi_fail_point(const char *name);
 extern GsiIndex *gsi_index_on_column(List *indexes, const char *col);
+extern Datum gsi_key_from_text(GsiIndex *idx, const char *text);
 extern void gsi_exec_on_all_nodes(GsiIndex *idx, const char *sql);
 extern void gsi_drop_index(GsiIndex *idx);
+
+/* gsi_build.c */
+extern void gsi_build_init(void);
 
 /* gsi_resolver.c */
 extern int	gsi_resolve_all(int grace_secs);
