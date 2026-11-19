@@ -166,7 +166,7 @@ gsi_resolve_all(int grace_secs)
 	{
 		servers = gsi_load_nodes(&nnodes, CurrentMemoryContext);
 		for (int i = 0; i < nnodes; i++)
-			collect_node(servers[i], grace_secs, (List **) &conns, &pending);
+			collect_node(servers[i], grace_secs, (List **) &conns, &pending); //collects prepared transaction for that node
 
 		/* index participants before base-only ones, across all nodes */
 		for (int pass = 0; pass < 2; pass++)
@@ -180,7 +180,7 @@ gsi_resolve_all(int grace_secs)
 
 				if (p->role != (pass == 0 ? 'i' : 'b'))
 					continue;
-				status = xact_status(p->fxid);
+				status = xact_status(p->fxid); //transactions status from the coordinator
 				if (status == NULL)
 					ereport(WARNING,
 							(errmsg("gsi resolver cannot decide \"%s\"", p->gid)));
