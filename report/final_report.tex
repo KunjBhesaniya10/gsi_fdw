@@ -1,0 +1,290 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage[hidelinks]{hyperref}
+\setlist{itemsep=2pt,topsep=3pt,leftmargin=*}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt}
+\titleformat{\section}{\large\bfseries}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.6em}{}
+\titlespacing*{\section}{0pt}{12pt}{4pt}
+\titlespacing*{\subsection}{0pt}{8pt}{3pt}
+
+\begin{document}
+
+\begin{center}
+  {\large\bfseries Distributed GSI Maintenance for Sharded PostgreSQL}\\[4pt]
+  {\small Kunj Bhesaniya (23B0995) \quad Dhruvraj Merchant (23B1041)\\
+  Dipen Sojitra (23B0913) \quad Harshil Solanki (23B1016)}\\[2pt]
+  {\small CS 631 \textperiodcentered{} November 2026}
+\end{center}
+
+\section*{Problem}
+When a table is sharded across PostgreSQL servers by primary key, a query on another column
+(\texttt{WHERE key = ?}) must ask every shard, also \texttt{UNIQUE(key)} cannot be enforced because
+each shard sees only its own rows. Systems like Spanner, CockroachDB and TiDB solve this with a
+\textbf{global secondary index (GSI)}; core PostgreSQL does not have this feature.
+
+We build a GSI for sharded PostgreSQL whose entry for key $k$ lives on node $\mathrm{hash}(k) \bmod N$,
+independent of where the row lives. Every write therefore touches two nodes, and the core challenge is
+\textbf{keeping base table and index consistent under concurrent writes and node crashes}. Here a
+\textbf{node} is one of the $N$ PostgreSQL data servers in the cluster. Each node holds one shard of
+\texttt{users} plus its slice of every GSI table; $\mathrm{hash}(k) \bmod N$ picks which node stores the
+index entry for $k$.
+
+\section{Setup: cluster, connections and GSI catalog}
+All our code is one PostgreSQL C extension, \textbf{\texttt{gsi\_fdw}}: a modified copy of \texttt{postgres\_fdw}.
+\begin{itemize}
+  \item \textbf{Cluster:} Docker Compose with 1 coordinator and $N$ data nodes (PostgreSQL 16). On the
+        coordinator, \texttt{users} is hash-partitioned by \texttt{id}; each partition is a foreign table
+        on one data node, so PostgreSQL's own partition routing sends each row to its shard. Any table
+        sharded this way can have GSIs.
+  \item \textbf{Connections:} we reuse postgres\_fdw's connection cache and its per-node remote
+        transactions, so index writes join the same transaction as the base write.
+  \item \textbf{GSI catalog:} the coordinator stores the list of nodes in \texttt{gsi.gsi\_node} and the
+        indexes, with their mode and build status, in \texttt{gsi.gsi\_index}.
+        \texttt{CALL gsi\_create(\textquotesingle{}users\textquotesingle{},
+        \textquotesingle{}key\textquotesingle{}, unique, mode)} creates an index table
+        \texttt{gsi\_users\_key(key, id, shard)} on every node and builds it.
+  \item \textbf{Placement:} the entry for key $k$ lives on node $\mathrm{hash}(k) \bmod N$, using the same
+        hash function PostgreSQL uses for hash partitioning.
+  \item \textbf{One entry per row} \texttt{(key, id, shard)}: the indexed value, the base row's
+        \texttt{id}, and the node that holds the row. With \texttt{id} and \texttt{shard}, a lookup fetches
+        the base row from exactly one node, and an UPDATE or DELETE removes exactly that row's entry.
+\end{itemize}
+
+\section{Reads: GSI plan selection and query routing}
+\begin{itemize}
+  \item \textbf{Plan selection:} a planner hook (\texttt{set\_rel\_pathlist\_hook}) sees
+        \texttt{WHERE key = <value>} (or any other column with a ready GSI) and adds our own plan, a
+        \textbf{GsiLookup CustomScan}, next to PostgreSQL's normal ``scan all shards'' plan. The planner
+        keeps the cheaper one (\S\ref{sec:cost}).
+  \item \textbf{Execution, two hops:} (1) hash the key and ask that one index node for
+        \texttt{(id, shard)}; (2) fetch \texttt{WHERE id = ANY(...)} from only those shards, in parallel.
+  \item \textbf{Recheck:} every original condition is re-evaluated on the fetched rows, so a stale or
+        wrong index entry can never produce a wrong result.
+\end{itemize}
+
+\subsection{Cost model}\label{sec:cost}
+At checkpoint 1 the GsiLookup plan had a fixed cost. It now depends on how many rows the key matches:
+a lookup is cheap for a selective key, but for a key that matches many rows on every shard it does about
+as much work as scanning all shards. The cost uses two estimates, both from statistics PostgreSQL already
+keeps:
+\begin{itemize}
+  \item \textbf{Matching entries $k$:} 1 for a unique GSI; otherwise PostgreSQL's own selectivity
+        estimate for \texttt{col = value} (from the table's \texttt{ANALYZE} statistics) times the
+        table's row count.
+  \item \textbf{Shards $S$ holding these rows:} rows are placed by the hash of their \texttt{id}, which is
+        unrelated to the key, so the $k$ rows fall on the $N$ shards independently and on average occupy
+        \[ S = N\bigl(1 - (1 - 1/N)^{k}\bigr) \]
+        shards: one for a unique key, approaching $N$ as $k$ grows.
+\end{itemize}
+The cost adds up the two hops and the recheck:
+\[
+  C = \underbrace{c_{rt} + c_{page}\lceil k/e\rceil + k\,c_{tup}}_{\text{hop 1: index node}}
+    \;+\; \underbrace{S\,c_{rt} + k\,c_{page} + k\,c_{tup}}_{\text{hop 2: } S \text{ shards}}
+    \;+\; \underbrace{k\,c_{qual}}_{\text{recheck}}
+\]
+Here $c_{rt}$ is the cost of one remote query, $c_{page}$ the cost of fetching one page, $c_{tup}$ the
+cost of shipping one row, and $c_{qual}$ the cost of checking the conditions on one row. Hop 1 reads the
+$k$ entries from $\lceil k/e\rceil$ pages ($e$ entries fit on a page), and hop 2 fetches one page per row.
+For these constants we use the same values as PostgreSQL and postgres\_fdw.
+
+\section{Writes: index maintenance and two-phase commit}
+Every INSERT, UPDATE and DELETE updates the base row and its entry in every sync GSI of the table in the
+same distributed transaction, committed atomically with two-phase commit (2PC).
+\begin{itemize}
+  \item \textbf{Write interception:} for writes that can change an index entry we disable postgres\_fdw's pushdown of whole \texttt{UPDATE ... WHERE}
+        statements and batched inserts, so our per-row hooks run. UPDATE and DELETE also fetch the
+        \textbf{old} key of every indexed column, so we know which entries to remove. An UPDATE that sets
+        no indexed column can't change any entry, so it keeps postgres\_fdw's normal pushdown and commit.
+  \item \textbf{2PC (in postgres\_fdw's commit callback):}
+  \begin{enumerate}
+    \item Before commit: \texttt{PREPARE TRANSACTION
+          \textquotesingle{}gsi\_<xid>\_<node>\_<role>\textquotesingle{}} on every node involved. Any
+          failure aborts everything.
+    \item Decision: the coordinator's own local commit. Its transaction id is in every prepared
+          transaction's name.
+    \item After commit: \texttt{COMMIT PREPARED} on \textbf{index nodes first, then base shards}, so a
+          visible row always has its index entry.
+  \end{enumerate}
+  \item \textbf{Global uniqueness:} a unique B-tree on the index node. A duplicate key fails the index
+        insert and aborts the whole transaction.
+  \item \textbf{Not supported:} changing \texttt{id} (foreign partitions cannot move rows between shards,
+        so we reject it).
+\end{itemize}
+
+\section{Recovery: finishing transactions after a crash}
+If the coordinator or a node crashes in the middle of 2PC, prepared transactions are left behind holding
+locks; our resolver finishes them automatically, following the coordinator's recorded decision.
+\begin{itemize}
+  \item \textbf{Resolver:} reads \texttt{pg\_prepared\_xacts} on each node, finds leftover
+        \texttt{gsi\_*} transactions, asks the coordinator whether that transaction committed
+        (\texttt{pg\_xact\_status}), then runs \texttt{COMMIT PREPARED} (index nodes first) or
+        \texttt{ROLLBACK PREPARED}. Transactions that are still running are left to their own session.
+  \item \textbf{Durable decision:} before the first PREPARE, the coordinator flushes a WAL record with
+        the transaction id. Otherwise a transaction that wrote only on data nodes leaves no trace on the
+        coordinator, and after a crash its id could be reused and a later commit mistaken for its decision.
+  \item \textbf{Data node crashes:} a node that crashes before answering PREPARE makes the whole
+        transaction roll back. A node that crashes after answering keeps its prepared transaction on
+        disk, and the resolver commits it once the node is back.
+  \item \textbf{Background worker:} runs the resolver every 5\,s inside the coordinator; no manual step.
+  \item \textbf{Fault injection:} a test-only setting \texttt{gsi.fail\_point} crashes the coordinator at
+        an exact step of the protocol to test the recovery code.
+\end{itemize}
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Crash point & Result after recovery \\
+\midrule
+Coordinator, after PREPARE, before its commit & Rolled back \\
+Coordinator, after its commit                & Rolled forward \\
+Coordinator, between index and base commit   & Base finished \\
+Data node, before PREPARE                    & Aborted everywhere \\
+Data node, after PREPARE                     & Committed by the resolver \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Asynchronous index maintenance}\label{sec:async}
+With a sync GSI every index change is a distributed transaction with 2PC, which makes writes slow. For
+indexes that may be a fraction of a second behind, we added an \textbf{async} mode, chosen per index
+(\texttt{gsi\_create(..., mode => \textquotesingle{}async\textquotesingle{})}): the index write is taken
+out of the user's transaction and applied shortly after the commit.
+\begin{itemize}
+  \item \textbf{Outbox:} instead of writing the index node, the write inserts a row
+        \texttt{(index, old key, new key, id)} into \texttt{gsi\_outbox} \textbf{on the base node, in the
+        same transaction as the base row}, so both commit or abort together. Such a write touches only
+        one node and commits without 2PC.
+  \item \textbf{Appliers:} background workers on the coordinator read the outbox rows in the order they
+        were written, apply them on the index nodes (delete the old key's entry, insert the new one), and
+        then delete them. If a worker crashes in between, the batch is applied again with the same result.
+  \item \textbf{Trade-offs:} a lookup may miss a row written moments ago (\texttt{gsi\_lag()} reports how
+        far behind the index is), but the recheck still prevents wrong results. A unique GSI must be sync,
+        since a duplicate has to be rejected before the write commits.
+\end{itemize}
+We chose an outbox over the change stream (logical decoding) planned at checkpoint 1 because our write
+path already knows the old and new key, and the data nodes stay plain PostgreSQL.
+
+\section{Online index build}\label{sec:build}
+At checkpoint 1, \texttt{gsi\_create} only worked on an empty table. It can now build a GSI on a table
+that already has data while reads and writes continue, similar to PostgreSQL's
+\texttt{CREATE INDEX CONCURRENTLY}:
+\begin{enumerate}
+  \item The index is created as \emph{write-only}: every new write maintains it, but the planner does not
+        use it yet.
+  \item The build waits for writes that started before step 1, since they did not know about the index.
+  \item \textbf{Backfill:} existing rows are indexed in chunks of 10,000 rows, each chunk one distributed
+        transaction that locks its rows briefly. Progress is saved per chunk, so an interrupted build
+        resumes where it stopped.
+  \item \textbf{Validation:} the number of entries and a hash over them are compared with the base rows,
+        with new writes paused for this short check.
+  \item The index is marked \emph{ready} and the planner can use it.
+\end{enumerate}
+
+\section{Results}\label{sec:results}
+\textbf{Setup:} 1 coordinator and 5 data nodes (PostgreSQL 16) in Docker on one laptop. All instances
+share the same CPU and disk, so absolute numbers are lower than on separate machines; the comparisons
+are what matter. The data nodes have no local index on the indexed column. After every experiment our
+consistency checker confirmed that every GSI was exact.
+
+\subsection{Reads: TPC-C customer lookup}
+\textbf{Data:} the TPC-C \texttt{customer} table with 10 warehouses (300,000 customers), hash-partitioned
+by \texttt{id}. TPC-C looks up customers by warehouse, district and last name; since our GSI covers one
+column, we combined the three into one key (about 3 customers per key). The workload is half
+Order-Status (look up a customer by last name) and half Payment (look up, then update the balance), with
+8 clients for 15 seconds.
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+ & Throughput (tps) & Avg latency (ms) & p99 (ms) \\
+\midrule
+Without GSI & 263   & 30.5 & 50.8 \\
+With GSI    & 1,651 & 4.8  & 10.2 \\
+\bottomrule
+\end{tabular}
+\end{center}
+With the GSI the system handles \textbf{6.3$\times$ more transactions per second}, and p99 latency is
+5$\times$ lower. Without it, every lookup scans the customer table on all five shards; with it, a lookup
+reads one index node and only the one to three shards holding the matching rows.
+
+\subsection{Writes: sync vs async}
+\textbf{Data:} the \texttt{users(id, key, name)} table, hash-partitioned by \texttt{id}, starting empty,
+with one GSI on \texttt{key}. 8 clients insert new rows for 15 seconds, then update the key of random
+rows for 15 seconds. We ran this without a GSI, with a sync GSI and with an async GSI.
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+ & Insert (tps) & Insert avg (ms) & Key update (tps) \\
+\midrule
+No GSI (baseline) & 1,158 & 6.9  & 759 \\
+Sync GSI          & 177   & 45.3 & 131 \\
+Async GSI         & 605   & 13.2 & 585 \\
+\bottomrule
+\end{tabular}
+\end{center}
+\textbf{Async writes are 3.4$\times$ faster than sync} (4.5$\times$ for key updates). A sync write
+prepares and commits on two nodes and records the decision on the coordinator, each step waiting for a
+disk flush; an async write commits once on one node. Since all our nodes share one disk, sync is
+especially expensive here.
+
+The price of async is a short delay: a new entry became visible about 56--119\,ms after commit (median,
+1 to 16 writers), so a lookup right after one's own write usually misses it. The appliers kept up: the
+outbox was empty within 0.3 seconds after each run.
+
+\subsection{Online index build}
+\textbf{Data:} the \texttt{users} table with 1,000,000 rows and a unique GSI on \texttt{key}. We build a new
+GSI on \texttt{name} (chunks of 10,000 rows) while 4 clients keep updating random rows.
+
+\begin{center}
+\begin{tabular}{lr}
+\toprule
+Build time & 27.4\,s \\
+Writers' p99 latency: before / during / after & 58 / 154 / 77\,ms \\
+Index after the build & exact (1,000,000 entries) \\
+\bottomrule
+\end{tabular}
+\end{center}
+The writers kept running throughout the build. Their p99 latency rose from 58 to 154\,ms while it ran,
+because a write to a row in the chunk being backfilled waits for that chunk to commit, and went back
+down afterwards. Larger chunks build faster but make writers wait longer.
+
+\section*{Limitations and future work}
+\textbf{Limitations:} there is no global snapshot, so during the short commit window a reader may see an
+index entry before its base row; the recheck keeps results correct. Deadlocks that span two nodes are not
+detected; a 5\,s lock timeout ends them and the client retries. Only \texttt{col = value} uses the GSI
+(\texttt{IN (...)}, ranges and \texttt{FOR UPDATE} ask every shard), and a GSI covers one column. Async
+GSIs do not let a session read its own writes through the index.
+
+\textbf{Future work:} multi-column GSIs (the TPC-C lookup needed three columns), lower async lag by
+waking the appliers on commit instead of polling, and adding data nodes without rebuilding the indexes.
+
+\section*{Use of AI}
+We used an AI assistant in two places: to understand PostgreSQL's code, and to write code. The design and
+the verification were done by us.
+\begin{itemize}
+  \item \textbf{Understanding PostgreSQL (with AI):} we used AI to find the PostgreSQL and postgres\_fdw
+        hooks relevant to our work, and to trace the call sequence of each part: planning and executing
+        a read, a foreign-table write, and the commit callbacks where 2PC happens.
+  \item \textbf{Design (by us):} with that understanding, we designed the GSI ourselves: the entry
+        format and placement, the catalog to maintain, the 2PC protocol and commit order, the recovery
+        rules, and the async and online-build schemes. We also planned which function each change goes
+        into.
+  \item \textbf{Coding (with AI):} the code was written with an AI coding assistant, which knows
+        PostgreSQL's internal structs and functions well, following our design and plan.
+  \item \textbf{Review and verification (by us):} we read through the generated code and checked it
+        against the PostgreSQL documentation and source, to confirm the right functions and APIs were
+        used. We verified the behaviour with tests (writes, 2PC, uniqueness, crash recovery, async
+        maintenance, online build), a consistency checker that compares each GSI with the base table,
+        and fault injection that crashes the coordinator at chosen points of the commit protocol.
+\end{itemize}
+
+\end{document}
