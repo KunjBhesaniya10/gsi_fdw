@@ -4184,7 +4184,9 @@ execute_foreign_modify(EState *estate,
 	if (fmstate->gsi)
 	{
 		Assert(*numSlots == 1);
-		gsi_note_base_write(fmstate->gsi, fmstate->conn);
+		// check if gsi is async or sync and mark connection for 2pc according to that
+		gsi_note_base_write(fmstate->gsi, fmstate->conn); 
+		// capture old gsi key information
 		gsi_capture_row(fmstate->gsi, operation, slots[0], planSlots[0]);
 	}
 

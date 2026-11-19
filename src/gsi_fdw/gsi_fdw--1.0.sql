@@ -54,11 +54,12 @@ CREATE TABLE gsi.gsi_index (
     UNIQUE (base_table, column_name)            -- one GSI per column, many per table
 );
 
--- Online build: last backfilled id per base node, committed with each chunk
+-- Online build: last backfilled id per base node, committed with each chunk.
+-- Text form of the partition key's type; NULL = nothing backfilled yet.
 CREATE TABLE gsi.gsi_build_progress (
     index_name  name NOT NULL,
     node        int NOT NULL,
-    last_id     bigint NOT NULL,
+    last_id     text,
     done        boolean NOT NULL DEFAULT false,
     PRIMARY KEY (index_name, node)
 );

@@ -41,7 +41,9 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/partcache.h"
 #include "utils/rel.h"
+#include "utils/typcache.h"
 
 PG_FUNCTION_INFO_V1(gsi_create);
 
@@ -74,19 +76,25 @@ node_conn(GsiIndex *idx, int node)
 	return GetConnection(GetUserMapping(GetUserId(), idx->servers[node]), false, NULL);
 }
 
-/* Append one element to a text-form array literal, quoted. */
-static void
-append_array_elem(StringInfo buf, const char *value)
+/* Remote schema-qualified name of a foreign partition's table */
+static char *
+remote_table_of(Oid partid)
 {
-	appendStringInfoChar(buf, buf->len == 0 ? '{' : ',');
-	appendStringInfoChar(buf, '"');
-	for (const char *p = value; *p; p++)
+	ForeignTable *ft = GetForeignTable(partid);
+	char	   *nsp = get_namespace_name(get_rel_namespace(partid));
+	char	   *relname = get_rel_name(partid);
+	ListCell   *lo;
+
+	foreach(lo, ft->options)
 	{
-		if (*p == '"' || *p == '\\')
-			appendStringInfoChar(buf, '\\');
-		appendStringInfoChar(buf, *p);
+		DefElem    *def = lfirst(lo);
+
+		if (strcmp(def->defname, "schema_name") == 0)
+			nsp = defGetString(def);
+		else if (strcmp(def->defname, "table_name") == 0)
+			relname = defGetString(def);
 	}
-	appendStringInfoChar(buf, '"');
+	return psprintf("%s.%s", quote_identifier(nsp), quote_identifier(relname));
 }
 
 /* Remote name of the base table on a node, from its foreign partition */
@@ -99,51 +107,48 @@ base_table_sql(Oid base, int node, GsiIndex *idx, char **key_col)
 	foreach(lc, children)
 	{
 		Oid			partid = lfirst_oid(lc);
-		ForeignTable *ft = GetForeignTable(partid);
-		char	   *nsp = get_namespace_name(get_rel_namespace(partid));
-		char	   *relname = get_rel_name(partid);
-		ListCell   *lo;
 
-		if (ft->serverid != idx->servers[node])
+		if (GetForeignTable(partid)->serverid != idx->servers[node])
 			continue;
-		foreach(lo, ft->options)
-		{
-			DefElem    *def = lfirst(lo);
-
-			if (strcmp(def->defname, "schema_name") == 0)
-				nsp = defGetString(def);
-			else if (strcmp(def->defname, "table_name") == 0)
-				relname = defGetString(def);
-		}
 		*key_col = (char *) quote_identifier(idx->column);
-		return psprintf("%s.%s", quote_identifier(nsp), quote_identifier(relname));
+		return remote_table_of(partid);
 	}
 	return NULL;
 }
 
 /*
- * Backfill one chunk on base node `node`: rows with id > *last_id, locked
- * FOR SHARE until the chunk's 2PC commit, so a concurrent UPDATE/DELETE of
- * them waits and then fixes the entry itself.  ON CONFLICT DO NOTHING skips
- * entries that concurrent writers already made.
+ * Backfill one chunk on base node `node`: rows with id > *last_id (all rows
+ * when *last_id is NULL), in the id type's order, locked FOR SHARE until the
+ * chunk's 2PC commit, so a concurrent UPDATE/DELETE of them waits and then
+ * fixes the entry itself.  ON CONFLICT DO NOTHING skips entries that
+ * concurrent writers already made.  *last_id is the text form of the last id.
  */
 static ChunkResult
 backfill_chunk(GsiIndex *idx, int node, const char *base_sql, const char *key_col,
-			   int64 *last_id, int64 *rows)
+			   char **last_id, int64 *rows)
 {
 	PGconn	   *base_conn = node_conn(idx, node);
 	StringInfoData *keys = palloc0(sizeof(StringInfoData) * idx->nnodes);
 	StringInfoData *ids = palloc0(sizeof(StringInfoData) * idx->nnodes);
+	const char *id_col = quote_identifier(idx->id_column);
+	const char *id_type = format_type_be_qualified(idx->id_typid);
 	const char *values[3];
 	char	   *sql;
 	PGresult   *res;
 	int			n;
 	char	   *state;
 
-	sql = psprintf("SELECT id, %s::text FROM %s WHERE id > $1 ORDER BY id LIMIT %d FOR SHARE",
-				   key_col, base_sql, gsi_build_chunk_size);
-	values[0] = psprintf(INT64_FORMAT, *last_id);
-	res = run_remote(base_conn, sql, 1, values);
+	if (*last_id == NULL)
+		sql = psprintf("SELECT %s::text AS gsi_id, %s::text AS gsi_key FROM %s "
+					   "ORDER BY %s LIMIT %d FOR SHARE",
+					   id_col, key_col, base_sql, id_col, gsi_build_chunk_size);
+	else
+		sql = psprintf("SELECT %s::text AS gsi_id, %s::text AS gsi_key FROM %s "
+					   "WHERE %s > $1::%s ORDER BY %s LIMIT %d FOR SHARE",
+					   id_col, key_col, base_sql, id_col, id_type, id_col,
+					   gsi_build_chunk_size);
+	values[0] = *last_id;
+	res = run_remote(base_conn, sql, *last_id == NULL ? 0 : 1, values);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
 		state = PQresultErrorField(res, PG_DIAG_SQLSTATE);
@@ -176,18 +181,18 @@ backfill_chunk(GsiIndex *idx, int node, const char *base_sql, const char *key_co
 			initStringInfo(&keys[target]);
 			initStringInfo(&ids[target]);
 		}
-		append_array_elem(&keys[target], PQgetvalue(res, i, 1));
-		append_array_elem(&ids[target], PQgetvalue(res, i, 0));
+		gsi_append_array_elem(&keys[target], PQgetvalue(res, i, 1));
+		gsi_append_array_elem(&ids[target], PQgetvalue(res, i, 0));
 	}
-	*last_id = strtoi64(PQgetvalue(res, n - 1, 0), NULL, 10);
+	*last_id = pstrdup(PQgetvalue(res, n - 1, 0));
 	*rows += n;
 	PQclear(res);
 
 	/* one INSERT per index node: unnest the keys and ids of this chunk */
 	sql = psprintf("INSERT INTO %s (key, id, shard) "
-				   "SELECT k, i, $3 FROM unnest($1::%s[], $2::pg_catalog.int8[]) AS u(k, i) "
+				   "SELECT k, i, $3 FROM unnest($1::%s[], $2::%s[]) AS u(k, i) "
 				   "ON CONFLICT (key, id) DO NOTHING",
-				   idx->remote_table, format_type_be_qualified(idx->typid));
+				   idx->remote_table, format_type_be_qualified(idx->typid), id_type);
 	for (int target = 0; target < idx->nnodes; target++)
 	{
 		PGconn	   *conn;
@@ -223,14 +228,20 @@ backfill_chunk(GsiIndex *idx, int node, const char *base_sql, const char *key_co
 	return CHUNK_DONE;
 }
 
-/* Last backfilled id on a node, from gsi.gsi_build_progress */
-static int64
-progress_get(const char *name, int node)
+/*
+ * Progress of a node's backfill, from gsi.gsi_build_progress: *done, and the
+ * text form of the last backfilled id (NULL = start from the first row),
+ * allocated in the caller's context.
+ */
+static char *
+progress_get(const char *name, int node, bool *done)
 {
+	MemoryContext cxt = CurrentMemoryContext;
 	Oid			argtypes[2] = {NAMEOID, INT4OID};
 	Datum		args[2];
-	int64		last = PG_INT64_MIN;
+	char	   *last = NULL;
 
+	*done = false;
 	args[0] = DirectFunctionCall1(namein, CStringGetDatum(name));
 	args[1] = Int32GetDatum(node);
 	SPI_connect();
@@ -242,11 +253,11 @@ progress_get(const char *name, int node)
 	{
 		bool		isnull;
 
-		if (DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull)))
-			last = PG_INT64_MAX;
-		else
-			last = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-											   SPI_tuptable->tupdesc, 1, &isnull));
+		*done = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull));
+		(void) SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+		if (!isnull)
+			last = MemoryContextStrdup(cxt, SPI_getvalue(SPI_tuptable->vals[0],
+														 SPI_tuptable->tupdesc, 1));
 	}
 	SPI_finish();
 	return last;
@@ -254,20 +265,21 @@ progress_get(const char *name, int node)
 
 /* Record progress in the same transaction as the chunk it describes */
 static void
-progress_set(const char *name, int node, int64 last_id, bool done)
+progress_set(const char *name, int node, const char *last_id, bool done)
 {
-	Oid			argtypes[4] = {NAMEOID, INT4OID, INT8OID, BOOLOID};
+	Oid			argtypes[4] = {NAMEOID, INT4OID, TEXTOID, BOOLOID};
 	Datum		args[4];
+	char		nulls[4] = {' ', ' ', last_id ? ' ' : 'n', ' '};
 
 	args[0] = DirectFunctionCall1(namein, CStringGetDatum(name));
 	args[1] = Int32GetDatum(node);
-	args[2] = Int64GetDatum(last_id);
+	args[2] = last_id ? CStringGetTextDatum(last_id) : (Datum) 0;
 	args[3] = BoolGetDatum(done);
 	SPI_connect();
 	if (SPI_execute_with_args("INSERT INTO gsi.gsi_build_progress (index_name, node, last_id, done) "
 							  "VALUES ($1, $2, $3, $4) ON CONFLICT (index_name, node) "
 							  "DO UPDATE SET last_id = $3, done = $4",
-							  4, argtypes, args, NULL, false, 0) != SPI_OK_INSERT)
+							  4, argtypes, args, nulls, false, 0) != SPI_OK_INSERT)
 		elog(ERROR, "could not write gsi.gsi_build_progress");
 	SPI_finish();
 }
@@ -295,6 +307,7 @@ backfill(Oid base, const char *col, const char *name)
 {
 	int64		total = 0;
 	int			nnodes = current_index(base, col, name)->nnodes;
+	MemoryContext outer_cxt = CurrentMemoryContext;
 
 	/* everything a chunk allocates; reset after each (1M rows = ~1,000 chunks) */
 	MemoryContext chunk_cxt = AllocSetContextCreate(CurrentMemoryContext,
@@ -303,20 +316,21 @@ backfill(Oid base, const char *col, const char *name)
 
 	for (int node = 0; node < nnodes; node++)
 	{
-		int64		last_id = progress_get(name, node);
+		bool		done;
+		char	   *last_id = progress_get(name, node, &done);	/* in outer_cxt */
 		int64		node_rows = 0;
 		int			retries = 0;
 		char	   *base_sql;
 		char	   *key_col;
 
-		if (last_id == PG_INT64_MAX)
+		if (done)
 			continue;			/* finished before a resume */
 
 		for (;;)
 		{
 			GsiIndex   *idx;
 			ChunkResult r;
-			int64		chunk_last = last_id;
+			char	   *chunk_last = last_id;
 			int64		chunk_rows = 0;
 
 			CHECK_FOR_INTERRUPTS();
@@ -362,7 +376,8 @@ backfill(Oid base, const char *col, const char *name)
 				SPI_commit();
 				break;
 			}
-			last_id = chunk_last;
+			/* chunk_last lives in chunk_cxt, which the next chunk resets */
+			last_id = MemoryContextStrdup(outer_cxt, chunk_last);
 			node_rows += chunk_rows;
 			progress_set(name, node, last_id, false);
 			SPI_commit();
@@ -417,11 +432,13 @@ validate(Oid base, const char *col, const char *name)
 
 		if (base_sql)
 		{
+			/* both sides render key and id with the same types, so the texts match */
 			fingerprint(conn,
 						psprintf("SELECT count(*), coalesce(sum(hashtextextended("
-								 "%s::text || ':' || id || ':' || %d, 0)::numeric), 0) "
+								 "%s::text || ':' || %s::text || ':' || %d, 0)::numeric), 0) "
 								 "FROM %s WHERE %s IS NOT NULL",
-								 key_col, node, base_sql, key_col),
+								 key_col, quote_identifier(idx->id_column), node,
+								 base_sql, key_col),
 						&c, &s);
 			base_cnt = DirectFunctionCall2(numeric_add, base_cnt,
 										   DirectFunctionCall3(numeric_in, CStringGetDatum(c), 0, -1));
@@ -430,7 +447,7 @@ validate(Oid base, const char *col, const char *name)
 		}
 		fingerprint(conn,
 					psprintf("SELECT count(*), coalesce(sum(hashtextextended("
-							 "key::text || ':' || id || ':' || shard, 0)::numeric), 0) FROM %s",
+							 "key::text || ':' || id::text || ':' || shard, 0)::numeric), 0) FROM %s",
 							 idx->remote_table),
 					&c, &s);
 		idx_cnt = DirectFunctionCall2(numeric_add, idx_cnt,
@@ -498,7 +515,7 @@ wait_for_outbox(Oid base, const char *col, const char *name)
  */
 static void
 create_index_tables(Relation rel, const char *col, const char *name,
-					bool is_unique, bool is_async)
+					Oid id_typid, bool is_unique, bool is_async)
 {
 	MemoryContext cxt = CurrentMemoryContext;
 	GsiIndex   *idx = palloc0(sizeof(GsiIndex));
@@ -515,10 +532,11 @@ create_index_tables(Relation rel, const char *col, const char *name,
 
 	gsi_exec_on_all_nodes(idx, psprintf("DROP TABLE IF EXISTS %s", idx->remote_table));
 	gsi_exec_on_all_nodes(idx,
-						  psprintf("CREATE TABLE %s (key %s NOT NULL, id bigint NOT NULL, "
+						  psprintf("CREATE TABLE %s (key %s NOT NULL, id %s NOT NULL, "
 								   "shard int NOT NULL, PRIMARY KEY (key, id))",
 								   idx->remote_table,
-								   format_type_be_qualified(idx->typid)));
+								   format_type_be_qualified(idx->typid),
+								   format_type_be_qualified(id_typid)));
 	if (is_unique)
 		gsi_exec_on_all_nodes(idx, psprintf("CREATE UNIQUE INDEX ON %s (key)",
 											idx->remote_table));
@@ -526,7 +544,7 @@ create_index_tables(Relation rel, const char *col, const char *name,
 		gsi_exec_on_all_nodes(idx,
 							  "CREATE TABLE IF NOT EXISTS public.gsi_outbox ("
 							  "seq bigserial PRIMARY KEY, index_name text NOT NULL, "
-							  "old_key text, new_key text, id bigint NOT NULL, "
+							  "old_key text, new_key text, id text NOT NULL, "
 							  "created_at timestamptz NOT NULL DEFAULT now())");
 }
 
@@ -573,6 +591,70 @@ set_ready(const char *name)
 }
 
 /*
+ * The row identifier GSI entries point to is the table's partition key; it
+ * must be one plain column (any name, any type with a btree ordering, which
+ * chunks the backfill), unique and NOT NULL on every shard.  Foreign
+ * partitions can't carry a primary key, so uniqueness is checked on each
+ * shard's own table: a unique, non-partial index on exactly that column.
+ * Partitioning by the column keeps one id on one shard, so per-shard
+ * uniqueness is global uniqueness.  Returns the column's type.
+ */
+static Oid
+check_row_identifier(Relation rel, char **id_column)
+{
+	PartitionKey key = RelationGetPartitionKey(rel);
+	Oid			typid;
+	TypeCacheEntry *tce;
+	ListCell   *lc;
+	const char *sql =
+		"SELECT 1 FROM pg_catalog.pg_index x "
+		"JOIN pg_catalog.pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = x.indkey[0] "
+		"WHERE x.indrelid = $1::pg_catalog.regclass AND x.indisunique AND x.indimmediate "
+		"AND x.indnkeyatts = 1 AND x.indpred IS NULL AND x.indexprs IS NULL "
+		"AND a.attname = $2 AND a.attnotnull LIMIT 1";
+
+	if (key->partnatts != 1 || key->partattrs[0] == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a table with a GSI must be partitioned by a single column"),
+				 errdetail("GSI entries identify rows by the partition key; expressions and multi-column keys are not supported.")));
+	*id_column = get_attname(RelationGetRelid(rel), key->partattrs[0], false);
+	typid = key->parttypid[0];
+
+	tce = lookup_type_cache(typid, TYPECACHE_LT_OPR | TYPECACHE_EQ_OPR);
+	if (!OidIsValid(tce->lt_opr) || !OidIsValid(tce->eq_opr))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("partition key type %s has no default btree ordering",
+						format_type_be(typid))));
+
+	foreach(lc, find_inheritance_children(RelationGetRelid(rel), NoLock))
+	{
+		Oid			partid = lfirst_oid(lc);
+		Oid			serverid = GetForeignTable(partid)->serverid;
+		PGconn	   *conn = GetConnection(GetUserMapping(GetUserId(), serverid), false, NULL);
+		const char *values[2];
+		PGresult   *res;
+		bool		ok;
+
+		values[0] = remote_table_of(partid);
+		values[1] = *id_column;
+		res = run_remote(conn, sql, 2, values);
+		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+			pgfdw_report_error(ERROR, res, conn, true, sql);
+		ok = PQntuples(res) > 0;
+		PQclear(res);
+		if (!ok)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+					 errmsg("shard table %s on server \"%s\" has no unique index on NOT NULL column \"%s\"",
+							values[0], GetForeignServer(serverid)->servername, *id_column),
+					 errhint("Make \"%s\" the primary key of every shard table.", *id_column)));
+	}
+	return typid;
+}
+
+/*
  * CALL gsi_create(base regclass, col name, is_unique bool DEFAULT false,
  *				   mode text DEFAULT 'sync')
  *
@@ -591,6 +673,8 @@ gsi_create(PG_FUNCTION_ARGS)
 	Relation	rel;
 	GsiIndex   *existing;
 	int64		rows;
+	char	   *id_column;
+	Oid			id_typid;
 
 	if (fcinfo->context == NULL || !IsA(fcinfo->context, CallContext) ||
 		((CallContext *) fcinfo->context)->atomic)
@@ -630,10 +714,7 @@ gsi_create(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_COLUMN),
 				 errmsg("column \"%s\" does not exist", col)));
-	if (get_atttype(base, get_attnum(base, "id")) != INT8OID)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("GSI tables need a bigint column \"id\"")));
+	id_typid = check_row_identifier(rel, &id_column);
 	name = psprintf("%s_%s", RelationGetRelationName(rel), col);
 
 	existing = gsi_index_on_column(gsi_indexes_for_rel(base), col);
@@ -653,10 +734,9 @@ gsi_create(PG_FUNCTION_ARGS)
 	}
 	else
 	{
-		create_index_tables(rel, col, name, is_unique, strcmp(mode, "async") == 0);
+		create_index_tables(rel, col, name, id_typid, is_unique, strcmp(mode, "async") == 0);
 		table_close(rel, NoLock);
 		SPI_commit();
-		/* a build that started meanwhile fails here on the catalog's keys */
 		rel = table_open(base, ShareUpdateExclusiveLock);
 		insert_write_only(base, col, name, is_unique, mode);
 	}

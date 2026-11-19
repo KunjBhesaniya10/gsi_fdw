@@ -5,6 +5,9 @@
  *
  * A GSI on column c of a hash-partitioned table stores one entry
  * (key, id, shard) per row in table gsi_<index> on node hash(key) mod N.
+ * "id" is the row identifier: the table's single-column partition key, of
+ * any name and type, unique and NOT NULL on every shard (gsi_create checks).
+ * Inside this module ids travel in their text form.
  * A sync GSI is written on postgres_fdw connections inside the remote
  * transactions, and any transaction that wrote one commits all remote
  * transactions with two-phase commit (see connection.c).  An async GSI
@@ -18,6 +21,7 @@
 
 #include "libpq-fe.h"
 #include "foreign/foreign.h"
+#include "lib/stringinfo.h"
 #include "nodes/execnodes.h"
 #include "nodes/pathnodes.h"
 #include "utils/relcache.h"
@@ -29,6 +33,8 @@ typedef struct GsiIndex
 	char	   *column;			/* indexed column name */
 	Oid			typid;
 	Oid			collid;
+	char	   *id_column;		/* row identifier: the partition key column */
+	Oid			id_typid;
 	bool		is_unique;
 	bool		is_ready;		/* status 'ready': the planner may use it */
 	bool		is_async;		/* mode 'async': maintained via the outbox */
@@ -50,14 +56,15 @@ typedef struct GsiModifyState
 	AttrNumber	old_id_junk;
 	bool		key_updated;	/* UPDATE assigns the indexed column */
 	FmgrInfo	key_out;
+	FmgrInfo	id_out;
 
-	/* current row, captured before the base write */
+	/* current row, captured before the base write; ids in text form */
 	char	   *old_key;		/* NULL if no entry to delete */
 	char	   *new_key;		/* NULL if no entry to insert */
 	int			old_node;
 	int			new_node;
-	int64		old_id;
-	int64		new_id;
+	char	   *old_id;
+	char	   *new_id;
 } GsiModifyState;
 
 /* gsi.c */
@@ -83,6 +90,7 @@ extern void gsi_pause_point(const char *name);
 extern GsiIndex *gsi_index_by_name(const char *name);
 extern GsiIndex *gsi_index_on_column(List *indexes, const char *col);
 extern Datum gsi_key_from_text(GsiIndex *idx, const char *text);
+extern void gsi_append_array_elem(StringInfo buf, const char *value);
 extern void gsi_exec_on_all_nodes(GsiIndex *idx, const char *sql);
 extern void gsi_drop_index(GsiIndex *idx);
 

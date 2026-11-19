@@ -48,7 +48,7 @@
 typedef struct GsiPart
 {
 	Oid			serverid;
-	char	   *select_sql;		/* SELECT <cols> FROM <remote> WHERE id = ANY($1) */
+	char	   *select_sql;		/* SELECT <cols> FROM <remote> WHERE <id> = ANY($1) */
 } GsiPart;
 
 typedef struct GsiScanState
@@ -460,9 +460,10 @@ gsi_begin_scan(CustomScanState *node, EState *estate, int eflags)
 				appendStringInfoString(&sql,
 									   quote_identifier(remote_column(partid, NameStr(att->attname))));
 		}
-		appendStringInfo(&sql, " FROM %s WHERE %s = ANY ($1::pg_catalog.int8[])",
+		appendStringInfo(&sql, " FROM %s WHERE %s = ANY ($1::%s[])",
 						 remote_table(partid),
-						 quote_identifier(remote_column(partid, "id")));
+						 quote_identifier(remote_column(partid, gss->idx->id_column)),
+						 format_type_be_qualified(gss->idx->id_typid));
 
 		gss->parts[gsi_server_node(gss->idx, serverid)].serverid = serverid;
 		gss->parts[gsi_server_node(gss->idx, serverid)].select_sql = sql.data;
@@ -525,13 +526,9 @@ gsi_fetch(GsiScanState *gss)
 		if (shard < 0 || shard >= idx->nnodes)
 			continue;
 		if (ids[shard].data == NULL)
-		{
 			initStringInfo(&ids[shard]);
-			appendStringInfoChar(&ids[shard], '{');
-		}
-		else
-			appendStringInfoChar(&ids[shard], ',');
-		appendStringInfoString(&ids[shard], PQgetvalue(res, i, 0));
+		/* quoted: an id of any type (text, uuid, ...) is one array element */
+		gsi_append_array_elem(&ids[shard], PQgetvalue(res, i, 0));
 	}
 	PQclear(res);
 

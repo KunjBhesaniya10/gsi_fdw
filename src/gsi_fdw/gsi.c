@@ -160,19 +160,26 @@ gsi_load_nodes(int *nnodes, MemoryContext cxt)
 	return servers;
 }
 
-/* GsiIndex rows: name, column, unique, ready, async, type, collation */
+/*
+ * GsiIndex rows: name, column, unique, ready, async, type, collation, and
+ * the row identifier (the partition key column, int2vector partattrs is
+ * 0-based): name, type.  gsi_create admits only single-column keys.
+ */
 #define GSI_INDEX_COLUMNS \
 	"SELECT i.index_name, i.column_name, i.is_unique, i.status = 'ready', " \
-	"i.mode = 'async', a.atttypid, a.attcollation " \
+	"i.mode = 'async', a.atttypid, a.attcollation, p.attname, p.atttypid " \
 	"FROM gsi.gsi_index i JOIN pg_catalog.pg_attribute a " \
-	"ON a.attrelid = i.base_table AND a.attname = i.column_name "
+	"ON a.attrelid = i.base_table AND a.attname = i.column_name " \
+	"JOIN pg_catalog.pg_partitioned_table pt ON pt.partrelid = i.base_table " \
+	"JOIN pg_catalog.pg_attribute p " \
+	"ON p.attrelid = i.base_table AND p.attnum = pt.partattrs[0] "
 
 /*
  * Run sql, a query on gsi.gsi_index taking one parameter, and return a List
  * of GsiIndex (one per row) allocated in cxt.  Caller must be in SPI.
  *
- * The catalog is read with the latest snapshot, not the transaction's: a
- * REPEATABLE READ writer must see an index whose build started after its
+ * The catalog is read with the latest snapshot (GetLatestSnapshot()), not the transaction's snapshot: 
+ * a REPEATABLE READ writer must see an index whose build started after its
  * snapshot was taken, or its writes would skip that index (see gsi_build.c).
  * read_only is false so that SPI advances the command counter and rows
  * written earlier in this transaction are visible.
@@ -212,6 +219,8 @@ read_indexes(const char *sql, Oid argtype, Datum arg, MemoryContext cxt)
 			idx->is_async = DatumGetBool(SPI_getbinval(tup, desc, 5, &isnull));
 			idx->typid = DatumGetObjectId(SPI_getbinval(tup, desc, 6, &isnull));
 			idx->collid = DatumGetObjectId(SPI_getbinval(tup, desc, 7, &isnull));
+			idx->id_column = pstrdup(NameStr(*DatumGetName(SPI_getbinval(tup, desc, 8, &isnull))));
+			idx->id_typid = DatumGetObjectId(SPI_getbinval(tup, desc, 9, &isnull));
 			idx->remote_table = psprintf("public.%s",
 										 quote_identifier(psprintf("gsi_%s", idx->name)));
 			idx->servers = servers;
@@ -273,6 +282,24 @@ gsi_key_from_text(GsiIndex *idx, const char *text)
 }
 
 /*
+ * Append one element, quoted, to a text-form array literal being built in
+ * buf (empty = first element).  The caller appends the closing '}'.
+ */
+void
+gsi_append_array_elem(StringInfo buf, const char *value)
+{
+	appendStringInfoChar(buf, buf->len == 0 ? '{' : ',');
+	appendStringInfoChar(buf, '"');
+	for (const char *p = value; *p; p++)
+	{
+		if (*p == '"' || *p == '\\')
+			appendStringInfoChar(buf, '\\');
+		appendStringInfoChar(buf, *p);
+	}
+	appendStringInfoChar(buf, '"');
+}
+
+/*
  * Index placement: the type's extended hash with the hash-partitioning seed,
  * mod N.  Every component (write, read, checker) must use this function.
  */
@@ -328,7 +355,7 @@ old_key_junk_name(GsiIndex *idx)
 
 /*
  * UPDATE/DELETE fetch the old key of every GSI and the old id, so the old
- * entries can be removed.
+ * entries can be removed.  All GSIs of a table share its id column.
  */
 void
 gsi_add_update_targets(PlannerInfo *root, Index rtindex, Relation rel,
@@ -342,14 +369,15 @@ gsi_add_update_targets(PlannerInfo *root, Index rtindex, Relation rel,
 
 		add_junk_column(root, rtindex, rel, idx->column, old_key_junk_name(idx));
 	}
-	add_junk_column(root, rtindex, rel, "id", "gsi_old_id");
+	add_junk_column(root, rtindex, rel,
+					((GsiIndex *) linitial(indexes))->id_column, "gsi_old_id");
 }
 
 /*
- * May postgres_fdw push this UPDATE/DELETE down as one remote statement?
+ * Can postgres_fdw push this UPDATE/DELETE down as one remote statement?
  * Only if it can't change an index entry: the table has no GSI, or it's an
- * UPDATE that sets no indexed column and not id.  Otherwise the per-row
- * path must run so the indexes are maintained.
+ * UPDATE that sets no indexed column and not the id column.  Otherwise the
+ * per-row path must run so the indexes are maintained.
  */
 bool
 gsi_direct_modify_ok(PlannerInfo *root, Index rtindex, CmdType operation)
@@ -365,7 +393,8 @@ gsi_direct_modify_ok(PlannerInfo *root, Index rtindex, CmdType operation)
 	if (operation != CMD_UPDATE)
 		return false;
 	get_translated_update_targetlist(root, rtindex, &tlist, &update_attrs);
-	if (list_member_int(update_attrs, get_attnum(relid, "id")))
+	if (list_member_int(update_attrs,
+						get_attnum(relid, ((GsiIndex *) linitial(indexes))->id_column)))
 		return false;
 	foreach(lc, indexes)
 	{
@@ -385,12 +414,23 @@ gsi_begin_modify(Relation rel, CmdType operation, Plan *subplan,
 	Oid			relid = RelationGetRelid(rel);
 	List	   *indexes = gsi_indexes_for_rel(relid);
 	List	   *states = NIL;
-	AttrNumber	id_attno = get_attnum(relid, "id");
+	const char *id_column;
+	AttrNumber	id_attno;
 	AttrNumber	old_id_junk = InvalidAttrNumber;
+	Oid			id_output;
+	bool		id_varlena;
 	ListCell   *lc;
 
 	if (indexes == NIL)
 		return NIL;
+
+	/* relid is a partition: attribute numbers in its numbering */
+	id_column = ((GsiIndex *) linitial(indexes))->id_column;
+	id_attno = get_attnum(relid, id_column);
+	if (id_attno == InvalidAttrNumber)
+		elog(ERROR, "column \"%s\" not found in \"%s\"",
+			 id_column, RelationGetRelationName(rel));
+	getTypeOutputInfo(((GsiIndex *) linitial(indexes))->id_typid, &id_output, &id_varlena);
 
 	if (operation == CMD_UPDATE || operation == CMD_DELETE)
 	{
@@ -426,7 +466,8 @@ gsi_begin_modify(Relation rel, CmdType operation, Plan *subplan,
 	if (operation == CMD_UPDATE && list_member_int(target_attrs, id_attno))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot update column \"id\" of a table with a GSI")));
+				 errmsg("cannot update column \"%s\" of a table with a GSI", id_column),
+				 errdetail("It is the partition key, which GSI entries point to.")));
 
 	foreach(lc, indexes)
 	{
@@ -442,6 +483,7 @@ gsi_begin_modify(Relation rel, CmdType operation, Plan *subplan,
 		gs->old_id_junk = old_id_junk;
 		getTypeOutputInfo(idx->typid, &typoutput, &typisvarlena);
 		fmgr_info(typoutput, &gs->key_out);
+		fmgr_info(id_output, &gs->id_out);
 
 		if (operation == CMD_UPDATE || operation == CMD_DELETE)
 			gs->old_key_junk = ExecFindJunkAttributeInTlist(subplan->targetlist,
@@ -460,12 +502,39 @@ gsi_begin_modify(Relation rel, CmdType operation, Plan *subplan,
 	return states;
 }
 
+/*
+ * Text form a remote session reads back as the same value: postgres_fdw's
+ * transmission settings (ISO dates, full float precision), so an id or key
+ * of type timestamp or float survives the trip whatever the local DateStyle.
+ */
+static char *
+output_for_remote(FmgrInfo *out, Datum value)
+{
+	int			nestlevel = set_transmission_modes();
+	char	   *text = OutputFunctionCall(out, value);
+
+	reset_transmission_modes(nestlevel);
+	return text;
+}
+
 static char *
 key_text(GsiModifyState *gs, Datum value, int *node)
 {
 	*node = gsi_node_for_datum(value, gs->idx->typid, gs->idx->collid,
 							   gs->idx->nnodes);
-	return OutputFunctionCall(&gs->key_out, value);
+	return output_for_remote(&gs->key_out, value);
+}
+
+/* Text form of a row's id; the shard's unique NOT NULL index rules out NULL */
+static char *
+id_text(GsiModifyState *gs, Datum value, bool isnull)
+{
+	if (isnull)
+		ereport(ERROR,
+				(errcode(ERRCODE_NOT_NULL_VIOLATION),
+				 errmsg("column \"%s\" of a table with a GSI must not be NULL",
+						gs->idx->id_column)));
+	return output_for_remote(&gs->id_out, value);
 }
 
 /*
@@ -488,8 +557,8 @@ capture_one(GsiModifyState *gs, CmdType operation,
 		d = ExecGetJunkAttribute(planSlot, gs->old_key_junk, &isnull);
 		if (!isnull)
 			gs->old_key = key_text(gs, d, &gs->old_node);
-		gs->old_id = DatumGetInt64(ExecGetJunkAttribute(planSlot, gs->old_id_junk,
-														&isnull));
+		d = ExecGetJunkAttribute(planSlot, gs->old_id_junk, &isnull);
+		gs->old_id = id_text(gs, d, isnull);
 	}
 	if (operation == CMD_DELETE)
 		return;
@@ -507,7 +576,10 @@ capture_one(GsiModifyState *gs, CmdType operation,
 	}
 
 	if (operation == CMD_INSERT)
-		gs->new_id = DatumGetInt64(slot_getattr(slot, gs->id_attno, &isnull));
+	{
+		d = slot_getattr(slot, gs->id_attno, &isnull);
+		gs->new_id = id_text(gs, d, isnull);
+	}
 	else
 		gs->new_id = gs->old_id;
 
@@ -530,7 +602,7 @@ gsi_capture_row(List *states, CmdType operation,
 
 /* Run one index statement on the node's connection, inside its remote xact. */
 static void
-send_index_op(GsiModifyState *gs, int node, const char *key, int64 id,
+send_index_op(GsiModifyState *gs, int node, const char *key, const char *id,
 			  bool insert)
 {
 	UserMapping *user = GetUserMapping(GetUserId(), gs->idx->servers[node]);
@@ -542,7 +614,7 @@ send_index_op(GsiModifyState *gs, int node, const char *key, int64 id,
 	gsi_mark_conn(conn, true);
 
 	values[0] = key;
-	values[1] = psprintf(INT64_FORMAT, id);
+	values[1] = id;				/* untyped: the server reads it as the id column's type */
 	values[2] = psprintf("%d", gs->base_node);
 	if (insert)
 		sql = psprintf("INSERT INTO %s (key, id, shard) VALUES ($1, $2, $3)",
@@ -559,8 +631,7 @@ send_index_op(GsiModifyState *gs, int node, const char *key, int64 id,
 		pgfdw_report_error(ERROR, res, conn, true, sql);
 
 	/*
-	 * We hold the base row's lock, so its committed entry exists.  Missing it
-	 * means this node's REPEATABLE READ snapshot predates that commit.
+	 a missing delete would mean some other transaction is concurrently updating the same key with old snapshot
 	 */
 	if (!insert && strcmp(PQcmdTuples(res), "1") != 0)
 	{
@@ -591,7 +662,7 @@ send_outbox_op(GsiModifyState *gs)
 	values[0] = gs->idx->name;
 	values[1] = gs->old_key;
 	values[2] = gs->new_key;
-	values[3] = psprintf(INT64_FORMAT, gs->new_key ? gs->new_id : gs->old_id);
+	values[3] = gs->new_key ? gs->new_id : gs->old_id;
 
 	if (!PQsendQueryParams(conn, sql, 4, NULL, values, NULL, NULL, 0))
 		pgfdw_report_error(ERROR, NULL, conn, false, sql);
