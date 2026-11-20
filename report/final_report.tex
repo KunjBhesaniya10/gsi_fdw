@@ -71,7 +71,7 @@ All our code is one PostgreSQL C extension, \textbf{\texttt{gsi\_fdw}}: a modifi
 \end{itemize}
 
 \subsection{Cost model}\label{sec:cost}
-At checkpoint 1 the GsiLookup plan had a fixed cost. It now depends on how many rows the key matches:
+ Cost depends on how many rows the key matches:
 a lookup is cheap for a selective key, but for a key that matches many rows on every shard it does about
 as much work as scanning all shards. The cost uses two estimates, both from statistics PostgreSQL already
 keeps:
@@ -139,15 +139,12 @@ locks; our resolver finishes them automatically, following the coordinator's rec
 \end{itemize}
 
 \begin{center}
-\begin{tabular}{ll}
+\begin{tabular}{lll}
 \toprule
-Crash point & Result after recovery \\
+Crash point (\texttt{gsi.fail\_point}) & State at the crash & Result after recovery \\
 \midrule
-Coordinator, after PREPARE, before its commit & Rolled back \\
-Coordinator, after its commit                & Rolled forward \\
-Coordinator, between index and base commit   & Base finished \\
-Data node, before PREPARE                    & Aborted everywhere \\
-Data node, after PREPARE                     & Committed by the resolver \\
+\texttt{after\_prepare}      & all prepared, not committed & Rolled back on every node \\
+\texttt{after\_local\_commit} & committed, nothing finished & Committed on every node \\
 \bottomrule
 \end{tabular}
 \end{center}
