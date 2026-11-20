@@ -49,8 +49,8 @@ All our code is one PostgreSQL C extension, \textbf{\texttt{gsi\_fdw}}: a modifi
   \item \textbf{GSI catalog:} the coordinator stores the list of nodes in \texttt{gsi.gsi\_node} and the
         indexes, with their mode and build status, in \texttt{gsi.gsi\_index}.
         \texttt{CALL gsi\_create(\textquotesingle{}users\textquotesingle{},
-        \textquotesingle{}key\textquotesingle{}, unique, mode)} creates an index table
-        \texttt{gsi\_users\_key(key, id, shard)} on every node and builds it.
+        \textquotesingle{}email\textquotesingle{}, unique, mode)} creates an index table
+        \texttt{gsi\_users\_email(email, id, shard)} on every node and builds it.
   \item \textbf{Placement:} the entry for key $k$ lives on node $\mathrm{hash}(k) \bmod N$, using the same
         hash function PostgreSQL uses for hash partitioning.
   \item \textbf{One entry per row} \texttt{(key, id, shard)}: the indexed value, the base row's
@@ -166,11 +166,9 @@ out of the user's transaction and applied shortly after the commit.
         far behind the index is), but the recheck still prevents wrong results. A unique GSI must be sync,
         since a duplicate has to be rejected before the write commits.
 \end{itemize}
-We chose an outbox over the change stream (logical decoding) planned at checkpoint 1 because our write
-path already knows the old and new key, and the data nodes stay plain PostgreSQL.
 
 \section{Online index build}\label{sec:build}
-At checkpoint 1, \texttt{gsi\_create} only worked on an empty table. It can now build a GSI on a table
+\texttt{gsi\_create} can build a GSI on a table
 that already has data while reads and writes continue, similar to PostgreSQL's
 \texttt{CREATE INDEX CONCURRENTLY}:
 \begin{enumerate}
@@ -186,10 +184,7 @@ that already has data while reads and writes continue, similar to PostgreSQL's
 \end{enumerate}
 
 \section{Results}\label{sec:results}
-\textbf{Setup:} 1 coordinator and 5 data nodes (PostgreSQL 16) in Docker on one laptop. All instances
-share the same CPU and disk, so absolute numbers are lower than on separate machines; the comparisons
-are what matter. The data nodes have no local index on the indexed column. After every experiment our
-consistency checker confirmed that every GSI was exact.
+\textbf{Setup:} 1 coordinator and 5 data nodes (PostgreSQL 16) in Docker on one laptop
 
 \subsection{Reads: TPC-C customer lookup}
 \textbf{Data:} the TPC-C \texttt{customer} table with 10 warehouses (300,000 customers), hash-partitioned
@@ -213,14 +208,14 @@ With the GSI the system handles \textbf{6.3$\times$ more transactions per second
 reads one index node and only the one to three shards holding the matching rows.
 
 \subsection{Writes: sync vs async}
-\textbf{Data:} the \texttt{users(id, key, name)} table, hash-partitioned by \texttt{id}, starting empty,
-with one GSI on \texttt{key}. 8 clients insert new rows for 15 seconds, then update the key of random
+\textbf{Data:} the \texttt{users(id, email, name)} table, hash-partitioned by \texttt{id}, starting empty,
+with one GSI on \texttt{email}. 8 clients insert new rows for 15 seconds, then update the email of random
 rows for 15 seconds. We ran this without a GSI, with a sync GSI and with an async GSI.
 
 \begin{center}
 \begin{tabular}{lrrr}
 \toprule
- & Insert (tps) & Insert avg (ms) & Key update (tps) \\
+ & Insert (tps) & Insert avg (ms) & Email update (tps) \\
 \midrule
 No GSI (baseline) & 1,158 & 6.9  & 759 \\
 Sync GSI          & 177   & 45.3 & 131 \\
@@ -228,7 +223,7 @@ Async GSI         & 605   & 13.2 & 585 \\
 \bottomrule
 \end{tabular}
 \end{center}
-\textbf{Async writes are 3.4$\times$ faster than sync} (4.5$\times$ for key updates). A sync write
+\textbf{Async writes are 3.4$\times$ faster than sync} (4.5$\times$ for email updates). A sync write
 prepares and commits on two nodes and records the decision on the coordinator, each step waiting for a
 disk flush; an async write commits once on one node. Since all our nodes share one disk, sync is
 especially expensive here.
@@ -238,7 +233,7 @@ The price of async is a short delay: a new entry became visible about 56--119\,m
 outbox was empty within 0.3 seconds after each run.
 
 \subsection{Online index build}
-\textbf{Data:} the \texttt{users} table with 1,000,000 rows and a unique GSI on \texttt{key}. We build a new
+\textbf{Data:} the \texttt{users} table with 1,000,000 rows and a unique GSI on \texttt{email}. We build a new
 GSI on \texttt{name} (chunks of 10,000 rows) while 4 clients keep updating random rows.
 
 \begin{center}
@@ -254,15 +249,12 @@ The writers kept running throughout the build. Their p99 latency rose from 58 to
 because a write to a row in the chunk being backfilled waits for that chunk to commit, and went back
 down afterwards. Larger chunks build faster but make writers wait longer.
 
-\section*{Limitations and future work}
-\textbf{Limitations:} there is no global snapshot, so during the short commit window a reader may see an
+\section*{Limitations}
+There is no global snapshot, so during the short commit window a reader may see an
 index entry before its base row; the recheck keeps results correct. Deadlocks that span two nodes are not
 detected; a 5\,s lock timeout ends them and the client retries. Only \texttt{col = value} uses the GSI
 (\texttt{IN (...)}, ranges and \texttt{FOR UPDATE} ask every shard), and a GSI covers one column. Async
 GSIs do not let a session read its own writes through the index.
-
-\textbf{Future work:} multi-column GSIs (the TPC-C lookup needed three columns), lower async lag by
-waking the appliers on commit instead of polling, and adding data nodes without rebuilding the indexes.
 
 \section*{Use of AI}
 We used an AI assistant in two places: to understand PostgreSQL's code, and to write code. The design and

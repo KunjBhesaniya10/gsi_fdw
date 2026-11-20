@@ -7,6 +7,8 @@ cd "$(dirname "$0")/../docker"
 docker compose exec -T coordinator psql -U postgres \
   -c "ALTER SYSTEM RESET gsi.resolver_grace" -c "SELECT pg_reload_conf()"
 for s in shard1 shard2 shard3 shard4 shard5; do
+  docker compose exec -T coordinator psql -U postgres \
+    -c "ALTER SERVER $s OPTIONS (SET use_remote_estimate 'true')"
   docker compose exec -T $s psql -U postgres \
     -c "ALTER SYSTEM RESET log_statement" -c "SELECT pg_reload_conf()"
 done

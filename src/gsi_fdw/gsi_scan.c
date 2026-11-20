@@ -154,8 +154,7 @@ find_key_clause(RelOptInfo *rel, Index rti, GsiIndex *idx, AttrNumber attnum,
 
 /*
  * Mean fdw_startup_cost and fdw_tuple_cost over the nodes, with
- * postgres_fdw's defaults.  The mean because at plan time the index node of
- * a $1 key is unknown; in practice all nodes have the same settings.
+ * postgres_fdw's defaults.
  */
 static void
 server_costs(GsiIndex *idx, Cost *startup, Cost *per_tuple)
