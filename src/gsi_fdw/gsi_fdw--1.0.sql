@@ -50,7 +50,8 @@ CREATE TABLE gsi.gsi_index (
     column_name name NOT NULL,
     is_unique   boolean NOT NULL DEFAULT false,
     mode        text NOT NULL DEFAULT 'sync' CHECK (mode IN ('sync', 'async')),
-    status      text NOT NULL DEFAULT 'ready' CHECK (status IN ('write-only', 'ready')),
+    status      text NOT NULL DEFAULT 'ready'
+                CHECK (status IN ('delete-only', 'write-only', 'ready')),
     UNIQUE (base_table, column_name)            -- one GSI per column, many per table
 );
 
@@ -64,8 +65,8 @@ CREATE TABLE gsi.gsi_build_progress (
     PRIMARY KEY (index_name, node)
 );
 
--- Builds online (status write-only -> backfill -> ready); calling it again
--- on an unfinished build resumes it.  Not inside a transaction block.
+-- Builds the GSI online: delete-only -> write-only -> backfill -> ready.
+-- Calling it again resumes an unfinished build.  Not inside a transaction block.
 CREATE PROCEDURE gsi_create(base regclass, col name, is_unique boolean DEFAULT false,
                             mode text DEFAULT 'sync')
 AS 'MODULE_PATHNAME'

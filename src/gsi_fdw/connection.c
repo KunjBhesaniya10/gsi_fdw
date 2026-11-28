@@ -2305,8 +2305,8 @@ disconnect_cached_connections(Oid serverid)
  *
  * Pre-commit first makes fxid durable on the coordinator, then sends PREPARE
  * TRANSACTION 'gsi_<fxid>_<server>_<i|b>' to every participant; any failure
- * aborts the whole transaction.  The coordinator's
- * local commit record for fxid is the decision.  After it, COMMIT PREPARED
+ * aborts the whole transaction.  The coordinator's local commit record for
+ * fxid is the decision.  After it, COMMIT PREPARED
  * goes to index participants ('i') before base-only ones ('b'), so a visible
  * base row always has a visible index entry.  Nothing may throw ERROR once
  * the decision is made; leftovers are finished by gsi_resolve().

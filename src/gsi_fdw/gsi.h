@@ -37,6 +37,7 @@ typedef struct GsiIndex
 	Oid			id_typid;
 	bool		is_unique;
 	bool		is_ready;		/* status 'ready': the planner may use it */
+	bool		is_delete_only; /* status 'delete-only': writes remove entries, add none */
 	bool		is_async;		/* mode 'async': maintained via the outbox */
 	int			nnodes;
 	Oid		   *servers;		/* foreign server of each node id */

@@ -21,7 +21,8 @@
   {\large\bfseries Distributed GSI Maintenance for Sharded PostgreSQL}\\[4pt]
   {\small Kunj Bhesaniya (23B0995) \quad Dhruvraj Merchant (23B1041)\\
   Dipen Sojitra (23B0913) \quad Harshil Solanki (23B1016)}\\[2pt]
-  {\small CS 631 \textperiodcentered{} November 2026}
+  {\small CS 631 \textperiodcentered{} November 2026}\\[2pt]
+  {\small Code: \url{https://github.com/KunjBhesaniya10/gsi_fdw}}
 \end{center}
 
 \section*{Problem}
@@ -56,6 +57,9 @@ All our code is one PostgreSQL C extension, \textbf{\texttt{gsi\_fdw}}: a modifi
   \item \textbf{One entry per row} \texttt{(key, id, shard)}: the indexed value, the base row's
         \texttt{id}, and the node that holds the row. With \texttt{id} and \texttt{shard}, a lookup fetches
         the base row from exactly one node, and an UPDATE or DELETE removes exactly that row's entry.
+  \item \textbf{Limitations:} a GSI covers \textbf{one column}; composite indexes such as
+        \texttt{(warehouse, district, last\_name)} are not supported. Both the base table and the index
+        are placed by \textbf{hash only}; range partitioning is not implemented (see Limitations).
 \end{itemize}
 
 \section{Reads: GSI plan selection and query routing}
@@ -115,8 +119,10 @@ same distributed transaction, committed atomically with two-phase commit (2PC).
   \end{enumerate}
   \item \textbf{Global uniqueness:} a unique B-tree on the index node. A duplicate key fails the index
         insert and aborts the whole transaction.
-  \item \textbf{Not supported:} changing \texttt{id} (foreign partitions cannot move rows between shards,
-        so we reject it).
+  \item \textbf{Limitation, no primary key update:} an UPDATE that changes \texttt{id} is rejected.
+        A new \texttt{id} can hash to a different shard, so the row would have to move, and foreign
+        partitions cannot move rows between shards. Every GSI entry also stores \texttt{(id, shard)},
+        so all of them would have to change as well.
 \end{itemize}
 
 \section{Recovery: finishing transactions after a crash}
@@ -168,20 +174,44 @@ out of the user's transaction and applied shortly after the commit.
 \end{itemize}
 
 \section{Online index build}\label{sec:build}
-\texttt{gsi\_create} can build a GSI on a table
-that already has data while reads and writes continue, similar to PostgreSQL's
-\texttt{CREATE INDEX CONCURRENTLY}:
+\texttt{gsi\_create} builds a GSI on a table that already has data while reads and writes continue.
+PostgreSQL's \texttt{CREATE INDEX CONCURRENTLY} does not carry over: it relies on one node's snapshots
+and transaction IDs, and its index never deletes entries (dead ones stay until VACUUM). Our entries live
+on other nodes, every write that changes a key deletes one, and the writes are distributed transactions.
+We therefore follow the online schema change protocol of Google F1 (Rae et al., \emph{PVLDB} 6(11),
+2013), which CockroachDB and TiDB also use: the index moves through states, and the build waits between
+states so that running writes are never more than one state apart.
 \begin{enumerate}
-  \item The index is created as \emph{write-only}: every new write maintains it, but the planner does not
-        use it yet.
-  \item The build waits for writes that started before step 1, since they did not know about the index.
-  \item \textbf{Backfill:} existing rows are indexed in chunks of 10,000 rows, each chunk one distributed
-        transaction that locks its rows briefly. Progress is saved per chunk, so an interrupted build
-        resumes where it stopped.
-  \item \textbf{Validation:} the number of entries and a hash over them are compared with the base rows,
-        with new writes paused for this short check.
+  \item The build takes a lock on the table that blocks schema changes (\texttt{ALTER}, \texttt{DROP},
+        another build) but not reads or writes, and holds it across all its transactions.
+  \item \textbf{Delete-only:} writes delete the entries of the old values they change, but add none,
+        and the planner does not use the index. The build then waits for writes that started before
+        this step, since they did not know about the index.
+  \item \textbf{Write-only:} writes also add entries. The build waits again for writes from the
+        previous state. Delete-only is needed because a write planned before the index existed may
+        delete a row that a newer write inserted: had the newer write added an entry, nobody would
+        delete it. With the extra state, every write still running when entries start being added at
+        least deletes them.
+  \item \textbf{Backfill:} existing rows are indexed in chunks of 10,000 rows, each chunk one
+        distributed transaction. The chunk reads its base rows in \texttt{READ COMMITTED} with
+        \texttt{FOR SHARE}, which waits for any write still changing one of them and then reads its
+        latest committed value, so a row changed during the build is never indexed with an old value.
+        Entries are added with \texttt{ON CONFLICT DO NOTHING}, as a write may have added one already.
+        Progress is saved per chunk, so an interrupted build resumes where it stopped.
+  \item A write that deletes the entry of a row the backfill has not reached yet finds nothing to
+        delete. Before going on, it checks that the entry is really absent and not just invisible to its
+        snapshot, by inserting the entry and deleting it again in the same transaction; if a committed
+        entry it cannot see is in the way, the write fails with a serialization error and the client
+        retries it.
+  \item \textbf{Validation:} new writes are paused and running ones finish (a share lock on the table).
+        Distributed transactions that committed on the coordinator but are still prepared on some node,
+        for example after a network failure, are finished first. Then the number of entries and a hash
+        over them are compared with the base rows.
   \item The index is marked \emph{ready} and the planner can use it.
 \end{enumerate}
+Concurrent writes therefore cannot make the build fail. It fails only for the reasons a normal build
+would: a duplicate key in a unique GSI, or a node that stays unreachable (a prepared transaction that
+cannot be finished within 60\,s). Running \texttt{gsi\_create} again resumes it.
 
 \section{Results}\label{sec:results}
 \textbf{Setup:} 1 coordinator and 5 data nodes (PostgreSQL 16) in Docker on one laptop
@@ -249,12 +279,51 @@ The writers kept running throughout the build. Their p99 latency rose from 58 to
 because a write to a row in the chunk being backfilled waits for that chunk to commit, and went back
 down afterwards. Larger chunks build faster but make writers wait longer.
 
+\textbf{Correctness under concurrent writes:} a stress test (\texttt{bench/build\_stress.py}) builds a GSI
+on 20,000 rows in small, slowed-down chunks while 8 clients insert, delete, change and null the key,
+change other columns and run two-row transactions, so writes land in every state of the build. After each
+build it compares every base row with every index entry. In 7 builds (4 on \texttt{name}, 3 on the unique
+\texttt{email}) every build succeeded and the index had no missing, extra or misplaced entry and no
+unfinished prepared transaction. Two targeted tests also passed: a delete planned before the build
+removes a row inserted during the delete-only state, and a delete of the row the backfill reaches last
+succeeds at once. During the builds up to 2\% of writes got a serialization error and had to be retried
+(see Limitations).
+
 \section*{Limitations}
-There is no global snapshot, so during the short commit window a reader may see an
-index entry before its base row; the recheck keeps results correct. Deadlocks that span two nodes are not
-detected; a 5\,s lock timeout ends them and the client retries. Only \texttt{col = value} uses the GSI
-(\texttt{IN (...)}, ranges and \texttt{FOR UPDATE} ask every shard), and a GSI covers one column. Async
-GSIs do not let a session read its own writes through the index.
+Each point gives the limitation, then (\emph{change}) what we would modify to remove it.
+\begin{itemize}
+  \item \textbf{One column per GSI.} Composite indexes such as \texttt{(warehouse, district, last\_name)}
+        are not supported. \emph{Change (moderate):} store a list of columns in \texttt{gsi\_index}, give
+        the index table one key column per indexed column, and hash the columns together for placement.
+        The planner hook uses the GSI only when every column has \texttt{col = value}, and the write
+        hooks, outbox, backfill and validation carry a tuple of keys instead of one value.
+  \item \textbf{No range partitioning.} The base table and the index are both placed by hash.
+        \emph{Change:} for the base table, PostgreSQL already routes rows by range, so only the cost
+        model's shard estimate $S$ (which assumes rows spread evenly) needs updating (easy). For the index,
+        a catalog of split points replaces $\mathrm{hash}(k) \bmod N$, the planner hook accepts
+        \texttt{<}, \texttt{>} and \texttt{BETWEEN} and asks every index node whose range overlaps, and
+        splitting a range moves entries with a backfill like the online build (hard).
+  \item \textbf{No primary key update.} An UPDATE that changes \texttt{id} is rejected.
+        \emph{Change (moderate):} remove the rejection in the update hook and turn the update into a
+        delete on the old shard plus an insert on the new shard in the same 2PC transaction. Every GSI
+        entry of the row gets the new \texttt{(id, shard)}, directly for a sync GSI or via the outbox for
+        an async one. The resolver needs no change.
+  \item \textbf{Only \texttt{col = value} uses the GSI.} \texttt{IN (...)}, ranges and \texttt{FOR UPDATE}
+        ask every shard. \emph{Change:} for \texttt{IN}, hash each value, query each index node it maps
+        to and merge the results (easy). Ranges need a range-partitioned index (above).
+  \item \textbf{No global snapshot.} During the short commit window a reader may see an index entry
+        before its base row; the recheck keeps results correct. \emph{Change (hard):} a global
+        timestamp or snapshot service shared by all nodes.
+  \item \textbf{Cross-node deadlocks are not detected.} A 5\,s lock timeout ends them and the client
+        retries. \emph{Change (moderate):} a detector on the coordinator that collects lock waits from
+        every node and aborts one transaction in each cycle.
+  \item \textbf{Some writes fail during an online build.} Up to 2\% of writes in our stress test
+        (Section~\ref{sec:results}) got a serialization error while the index was being built: the
+        backfill added an entry after the write's snapshot on that node was taken, so the write could
+        not see the entry it had to delete. The client has to retry. \emph{Change (moderate):} while the
+        index is not ready, let such a write leave the entry, and have validation delete entries whose
+        base row no longer has that key.
+\end{itemize}
 
 \section*{Use of AI}
 We used an AI assistant in two places: to understand PostgreSQL's code, and to write code. The design and

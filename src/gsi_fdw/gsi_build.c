@@ -3,21 +3,26 @@
  * gsi_build.c
  *		  CALL gsi_create(): build a GSI online, on an empty or a full table
  *
- * Like CREATE INDEX CONCURRENTLY, in several transactions, never blocking
- * reads or writes of the table:
- *	1. create the index tables, catalog row with status 'write-only'; commit.
- *	   From then on every write maintains the index, the planner ignores it.
- *	2. wait for writers that started before step 1 (they don't know the
- *	   index), so every row is either written after step 1 or visible to 3.
- *	3. backfill: per shard, chunks of rows by id, each chunk one distributed
+ * Follows F1's online schema change (Rae et al., PVLDB 2013): the index
+ * moves through states, and between states the build waits for the writes
+ * still using the previous one.  Reads and writes are never blocked; a
+ * session ShareUpdateExclusiveLock keeps DDL, TRUNCATE and gsi_drop out for
+ * the whole build.
+ *	1. Create the index tables and the catalog row, status 'delete-only'.
+ *	   Writes now delete entries but add none.  Wait for older writes, which
+ *	   don't know the index.
+ *	2. Status 'write-only': writes also add entries; the planner still
+ *	   ignores the index.  Wait again, so no write that ignores the index
+ *	   runs alongside one that adds entries (it could delete a row and leave
+ *	   the row's entry behind).
+ *	3. Backfill: per node, chunks of rows by id, each one distributed
  *	   transaction that locks its rows FOR SHARE and inserts their entries.
- *	4. validate: entries = base rows (count and hash per index), with new
- *	   writes paused for the few seconds it takes (see gsi_create).
- *	5. status 'ready'; ANALYZE the table for the planner's estimates.
- * Every write passes through the one coordinator, so waiting out older
- * writers (step 2) is enough; no separate delete-only state is needed.
- * Progress is committed with each chunk; calling gsi_create again on a
- * 'write-only' index resumes it.
+ *	4. Pause new writes, finish in-doubt 2PC, validate entries against the
+ *	   base rows (count and hash).
+ *	5. Status 'ready'; ANALYZE the table.
+ * Every write goes through the one coordinator, so waiting on its table
+ * lock replaces F1's leases.  Progress commits with each chunk; calling
+ * gsi_create again resumes an unfinished build.
  *
  *-------------------------------------------------------------------------
  */
@@ -50,8 +55,28 @@ PG_FUNCTION_INFO_V1(gsi_create);
 static int	gsi_build_chunk_size = 10000;
 static int	gsi_build_chunk_delay = 0;
 
-/* SQLSTATEs a chunk retries after: serialization, deadlock, lock timeout */
+/* retries of one chunk after serialization failure, deadlock or lock timeout */
 #define CHUNK_MAX_RETRIES	100
+
+/* wait for in-doubt 2PC before validation: up to 120 rounds of 0.5 s */
+#define IN_DOUBT_MAX_ROUNDS	120
+
+/* the table being built; its session lock is held for the whole build */
+static LockRelId build_lockrelid;
+
+/*
+ * Retake the build's session lock.  An abort (SPI_rollback) releases session
+ * locks too, so after one the lock must be taken again.
+ */
+static void
+keep_build_lock(void)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_RELATION(tag, build_lockrelid.dbId, build_lockrelid.relId);
+	if (!LockHeldByMe(&tag, ShareUpdateExclusiveLock))
+		LockRelationIdForSession(&build_lockrelid, ShareUpdateExclusiveLock);
+}
 
 typedef enum ChunkResult
 {
@@ -118,10 +143,15 @@ base_table_sql(Oid base, int node, GsiIndex *idx, char **key_col)
 
 /*
  * Backfill one chunk on base node `node`: rows with id > *last_id (all rows
- * when *last_id is NULL), in the id type's order, locked FOR SHARE until the
- * chunk's 2PC commit, so a concurrent UPDATE/DELETE of them waits and then
- * fixes the entry itself.  ON CONFLICT DO NOTHING skips entries that
- * concurrent writers already made.  *last_id is the text form of the last id.
+ * when NULL), in id order, locked FOR SHARE until the chunk commits, so a
+ * concurrent UPDATE/DELETE of them waits and then fixes the entry itself.
+ * ON CONFLICT DO NOTHING skips entries that writers already added.  Sets
+ * *last_id to the text form of the chunk's last id.
+ *
+ * The base read runs in READ COMMITTED: FOR SHARE waits for a writer of the
+ * row, then returns its latest version (or skips it if deleted), where
+ * REPEATABLE READ would fail with 40001.  Ids never change, so paging by
+ * "id > last" still holds.
  */
 static ChunkResult
 backfill_chunk(GsiIndex *idx, int node, const char *base_sql, const char *key_col,
@@ -147,6 +177,12 @@ backfill_chunk(GsiIndex *idx, int node, const char *base_sql, const char *key_co
 					   "WHERE %s > $1::%s ORDER BY %s LIMIT %d FOR SHARE",
 					   id_col, key_col, base_sql, id_col, id_type, id_col,
 					   gsi_build_chunk_size);
+	/* first query of the chunk's remote transaction: no snapshot yet */
+	res = run_remote(base_conn, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED", 0, NULL);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pgfdw_report_error(ERROR, res, base_conn, true, "SET TRANSACTION");
+	PQclear(res);
+
 	values[0] = *last_id;
 	res = run_remote(base_conn, sql, *last_id == NULL ? 0 : 1, values);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
@@ -347,6 +383,7 @@ backfill(Oid base, const char *col, const char *name)
 			if (r == CHUNK_RETRY)
 			{
 				SPI_rollback();
+				keep_build_lock();
 				if (++retries > CHUNK_MAX_RETRIES)
 					ereport(ERROR,
 							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -548,10 +585,10 @@ create_index_tables(Relation rel, const char *col, const char *name,
 							  "created_at timestamptz NOT NULL DEFAULT now())");
 }
 
-/* Step 1b: the catalog row in status 'write-only'; writes maintain it from now on */
+/* Step 1b: the catalog row in status 'delete-only'; writes remove entries from now on */
 static void
-insert_write_only(Oid base, const char *col, const char *name,
-				  bool is_unique, const char *mode)
+insert_delete_only(Oid base, const char *col, const char *name,
+				   bool is_unique, const char *mode)
 {
 	Oid			argtypes[5] = {NAMEOID, REGCLASSOID, NAMEOID, BOOLOID, TEXTOID};
 	Datum		args[5];
@@ -564,13 +601,123 @@ insert_write_only(Oid base, const char *col, const char *name,
 	SPI_connect();
 	if (SPI_execute_with_args("INSERT INTO gsi.gsi_index "
 							  "(index_name, base_table, column_name, is_unique, mode, status) "
-							  "VALUES ($1, $2, $3, $4, $5, 'write-only')",
+							  "VALUES ($1, $2, $3, $4, $5, 'delete-only')",
 							  5, argtypes, args, NULL, false, 0) != SPI_OK_INSERT)
 		elog(ERROR, "could not insert into gsi.gsi_index");
 	SPI_finish();
 
 	/* cached plans of the table were made without this GSI: replan them */
 	CacheInvalidateRelcacheByRelid(base);
+}
+
+/* Step 2: status 'write-only'; writes maintain the index from now on */
+static void
+set_write_only(Oid base, const char *name)
+{
+	Oid			argtypes[1] = {NAMEOID};
+	Datum		args[1];
+
+	args[0] = DirectFunctionCall1(namein, CStringGetDatum(name));
+	SPI_connect();
+	if (SPI_execute_with_args("UPDATE gsi.gsi_index SET status = 'write-only' WHERE index_name = $1",
+							  1, argtypes, args, NULL, false, 0) != SPI_OK_UPDATE)
+		elog(ERROR, "could not update gsi.gsi_index");
+	SPI_finish();
+	CacheInvalidateRelcacheByRelid(base);
+}
+
+/*
+ * Wait until every transaction that holds a lock conflicting with ShareLock
+ * on base, i.e. every writer of the table, has ended.  Our own session lock
+ * doesn't count.  Writers that start later see the catalog as committed now.
+ */
+static void
+wait_for_writers(Oid base)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_RELATION(tag, MyDatabaseId, base);
+	WaitForLockers(tag, ShareLock, true);
+}
+
+/* gids of the gsi_ prepared transactions on one node, as a text[] literal, or NULL if none */
+static char *
+prepared_gids(PGconn *conn, const char *among)
+{
+	const char *values[1] = {among};
+	PGresult   *res = PQexecParams(conn,
+								   among == NULL
+								   ? "SELECT gid FROM pg_catalog.pg_prepared_xacts WHERE gid LIKE 'gsi\\_%'"
+								   : "SELECT gid FROM pg_catalog.pg_prepared_xacts WHERE gid = ANY ($1::text[])",
+								   among == NULL ? 0 : 1, NULL, values, NULL, NULL, 0);
+	StringInfoData buf;
+
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		PQclear(res);
+		gsi_disconnect_raw(conn);
+		ereport(ERROR, (errmsg("gsi_create: could not list prepared transactions on a node")));
+	}
+	initStringInfo(&buf);
+	for (int i = 0; i < PQntuples(res); i++)
+		gsi_append_array_elem(&buf, PQgetvalue(res, i, 0));
+	PQclear(res);
+	if (buf.len == 0)
+		return NULL;
+	appendStringInfoChar(&buf, '}');
+	return buf.data;
+}
+
+/*
+ * Step 4a, with new writes paused: wait until the gsi_ prepared transactions
+ * that exist now are finished.  One left behind (its COMMIT PREPARED never
+ * reached a node, e.g. after a network failure) would fail validation.  Run
+ * the resolver here instead of waiting for its next round.  Prepared
+ * transactions that appear later belong to other tables, so only the
+ * current ones count.
+ */
+static void
+finish_in_doubt(Oid base, const char *col, const char *name)
+{
+	GsiIndex   *idx = current_index(base, col, name);
+	char	  **gids = palloc0(sizeof(char *) * idx->nnodes);
+	bool		any = false;
+
+	for (int node = 0; node < idx->nnodes; node++)
+	{
+		PGconn	   *conn = gsi_connect_raw(GetForeignServer(idx->servers[node]),
+										   GetUserMapping(GetUserId(), idx->servers[node]));
+
+		gids[node] = prepared_gids(conn, NULL);
+		any |= gids[node] != NULL;
+		gsi_disconnect_raw(conn);
+	}
+
+	for (int round = 0; any; round++)
+	{
+		if (round >= IN_DOUBT_MAX_ROUNDS)
+			ereport(ERROR,
+					(errmsg("gsi_create: in-doubt prepared transactions did not finish; is a node down?"),
+					 errhint("Call gsi_create again to resume once gsi_resolve() succeeds.")));
+		/* skip those prepared < 1 s ago: their own backend is still finishing them */
+		(void) gsi_resolve_all(1);
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(500000L);
+
+		any = false;
+		for (int node = 0; node < idx->nnodes; node++)
+		{
+			PGconn	   *conn;
+
+			if (gids[node] == NULL)
+				continue;
+			conn = gsi_connect_raw(GetForeignServer(idx->servers[node]),
+								   GetUserMapping(GetUserId(), idx->servers[node]));
+			gids[node] = prepared_gids(conn, gids[node]);
+			any |= gids[node] != NULL;
+			gsi_disconnect_raw(conn);
+		}
+	}
 }
 
 static void
@@ -703,8 +850,14 @@ gsi_create(PG_FUNCTION_ARGS)
 
 	SPI_connect_ext(SPI_OPT_NONATOMIC);
 
-	/* writes go on; DDL on the table and other gsi_create/gsi_drop wait */
+	/*
+	 * Writes go on; DDL on the table (TRUNCATE, ALTER TABLE) and other
+	 * gsi_create/gsi_drop wait until the build ends: a session lock survives
+	 * the commits between the steps.  An error releases it.
+	 */
 	rel = table_open(base, ShareUpdateExclusiveLock);
+	build_lockrelid = rel->rd_lockInfo.lockRelId;
+	LockRelationIdForSession(&build_lockrelid, ShareUpdateExclusiveLock);
 	if (rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
@@ -738,18 +891,23 @@ gsi_create(PG_FUNCTION_ARGS)
 		table_close(rel, NoLock);
 		SPI_commit();
 		rel = table_open(base, ShareUpdateExclusiveLock);
-		insert_write_only(base, col, name, is_unique, mode);
+		insert_delete_only(base, col, name, is_unique, mode);
 	}
 	table_close(rel, NoLock);
 	SPI_commit();
 
-	/* step 2: writers that might not know the index yet must finish */
+	/*
+	 * Step 1, then 2.  Each wait is for the writers that started before the
+	 * status change just committed: after the first, every writer removes
+	 * entries; after the second, every writer maintains the index.
+	 */
+	if (existing == NULL || existing->is_delete_only)
 	{
-		LOCKTAG		tag;
-
-		SET_LOCKTAG_RELATION(tag, MyDatabaseId, base);
-		WaitForLockers(tag, ShareLock, true);
+		wait_for_writers(base);
+		set_write_only(base, name);
+		SPI_commit();
 	}
+	wait_for_writers(base);
 
 	rows = backfill(base, col, name);
 
@@ -760,6 +918,7 @@ gsi_create(PG_FUNCTION_ARGS)
 	 * wrong.  Only for the validation, a few seconds per million rows.
 	 */
 	LockRelationOid(base, ShareLock);
+	finish_in_doubt(base, col, name);
 	if (strcmp(mode, "async") == 0)
 		wait_for_outbox(base, col, name);
 	validate(base, col, name);
@@ -774,6 +933,7 @@ gsi_create(PG_FUNCTION_ARGS)
 					false, 0) != SPI_OK_UTILITY)
 		elog(ERROR, "could not ANALYZE the table");
 	SPI_commit();
+	UnlockRelationIdForSession(&build_lockrelid, ShareUpdateExclusiveLock);
 
 	ereport(NOTICE,
 			(errmsg("gsi_create: \"%s\" ready (" INT64_FORMAT " rows backfilled)", name, rows)));

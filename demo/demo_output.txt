@@ -1,0 +1,192 @@
+
+[Enter] next section 
+==================================================================
+ 1. Read path: lookup by email through the GSI
+==================================================================
+
+SELECT * FROM users WHERE email = 'user123456@mail.org';
+   id   |        email        |     name      
+--------+---------------------+---------------
+ 123456 | user123456@mail.org | Thomas Miller
+(1 row)
+
+EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'user123456@mail.org';
+                                                    QUERY PLAN                                                     
+-------------------------------------------------------------------------------------------------------------------
+ Custom Scan (GsiLookup) on users  (cost=200.00..208.07 rows=5 width=40) (actual time=0.658..0.659 rows=1 loops=1)
+   Filter: (email = 'user123456@mail.org'::text)
+   GSI: users_email
+   Estimated Entries: 1
+   Estimated Shards: 1.0
+   Index Node: 3
+   Shards Fetched: 1
+ Planning Time: 0.452 ms
+ Execution Time: 1.061 ms
+(9 rows)
+
+SET gsi.enable_lookup = off;
+SET
+EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'user123456@mail.org';
+                                                         QUERY PLAN                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ Append  (cost=100.00..22375.14 rows=5 width=40) (actual time=10.389..56.878 rows=1 loops=1)
+   ->  Foreign Scan on users_p0 users_1  (cost=100.00..4456.26 rows=1 width=40) (actual time=10.388..10.389 rows=1 loops=1)
+   ->  Foreign Scan on users_p1 users_2  (cost=100.00..4488.77 rows=1 width=40) (actual time=10.809..10.809 rows=0 loops=1)
+   ->  Foreign Scan on users_p2 users_3  (cost=100.00..4470.56 rows=1 width=40) (actual time=13.235..13.235 rows=0 loops=1)
+   ->  Foreign Scan on users_p3 users_4  (cost=100.00..4481.91 rows=1 width=40) (actual time=11.525..11.526 rows=0 loops=1)
+   ->  Foreign Scan on users_p4 users_5  (cost=100.00..4477.62 rows=1 width=40) (actual time=10.904..10.904 rows=0 loops=1)
+ Planning Time: 0.058 ms
+ Execution Time: 58.777 ms
+(8 rows)
+
+
+[Enter] next section 
+==================================================================
+ 2. Writes keep the GSI up to date: insert, update, delete
+==================================================================
+
+INSERT INTO users VALUES (9000001, 'demo1@x', 'Demo One')
+INSERT 0 1
+SELECT * FROM users WHERE email = 'demo1@x'
+   id    |  email  |   name   
+---------+---------+----------
+ 9000001 | demo1@x | Demo One
+(1 row)
+
+-- email index entry of 'demo1@x' on shard5:
+   key   |   id    | shard 
+---------+---------+-------
+ demo1@x | 9000001 |     0
+(1 row)
+
+UPDATE users SET email = 'demo1-new@x' WHERE id = 9000001
+UPDATE 1
+SELECT * FROM users WHERE email = 'demo1@x'
+ id | email | name 
+----+-------+------
+(0 rows)
+
+SELECT * FROM users WHERE email = 'demo1-new@x'
+   id    |    email    |   name   
+---------+-------------+----------
+ 9000001 | demo1-new@x | Demo One
+(1 row)
+
+-- email index entry of 'demo1@x' on shard5:
+ key | id | shard 
+-----+----+-------
+(0 rows)
+
+-- email index entry of 'demo1-new@x' on shard3:
+     key     |   id    | shard 
+-------------+---------+-------
+ demo1-new@x | 9000001 |     0
+(1 row)
+
+DELETE FROM users WHERE id = 9000001
+DELETE 1
+SELECT * FROM users WHERE email = 'demo1-new@x'
+ id | email | name 
+----+-------+------
+(0 rows)
+
+-- email index entry of 'demo1-new@x' on shard3:
+ key | id | shard 
+-----+----+-------
+(0 rows)
+
+
+[Enter] next section 
+==================================================================
+ 3. One insert = one distributed transaction (2PC)
+==================================================================
+
+SET gsi.trace = on;
+SET
+INSERT INTO users VALUES (9000002, 'twopc@x', 'Two Phase');
+NOTICE:  gsi: 2PC for xid 884, participants: shard2 (base), shard1 (index), shard5 (index)
+NOTICE:  gsi: PREPARE TRANSACTION 'gsi_884_shard2_b' on shard2 ...
+NOTICE:  gsi:   ... prepared on shard2
+NOTICE:  gsi: PREPARE TRANSACTION 'gsi_884_shard1_i' on shard1 ...
+NOTICE:  gsi:   ... prepared on shard1
+NOTICE:  gsi: PREPARE TRANSACTION 'gsi_884_shard5_i' on shard5 ...
+NOTICE:  gsi:   ... prepared on shard5
+NOTICE:  gsi: all participants prepared; the local commit of xid 884 is the decision: commit
+NOTICE:  gsi: COMMIT PREPARED 'gsi_884_shard1_i' on shard1: ok
+NOTICE:  gsi: COMMIT PREPARED 'gsi_884_shard5_i' on shard5: ok
+INSERT 0 1
+NOTICE:  gsi: COMMIT PREPARED 'gsi_884_shard2_b' on shard2: ok
+
+-- what the data nodes received:
+shard2-1  | 2026-11-20 10:54:16.709 UTC [8983] LOG:  statement: PREPARE TRANSACTION 'gsi_884_shard2_b'
+shard1-1  | 2026-11-20 10:54:16.710 UTC [9012] LOG:  statement: PREPARE TRANSACTION 'gsi_884_shard1_i'
+shard5-1  | 2026-11-20 10:54:16.712 UTC [9073] LOG:  statement: PREPARE TRANSACTION 'gsi_884_shard5_i'
+shard1-1  | 2026-11-20 10:54:16.714 UTC [9012] LOG:  statement: COMMIT PREPARED 'gsi_884_shard1_i'
+shard5-1  | 2026-11-20 10:54:16.715 UTC [9073] LOG:  statement: COMMIT PREPARED 'gsi_884_shard5_i'
+shard2-1  | 2026-11-20 10:54:16.716 UTC [8983] LOG:  statement: COMMIT PREPARED 'gsi_884_shard2_b'
+
+[Enter] next section 
+==================================================================
+ 4a. Coordinator crashes AFTER the commit decision -> roll forward
+==================================================================
+
+SET gsi.fail_point = 'after_local_commit';
+SET
+INSERT INTO users VALUES (9000003, 'crash@x', 'Crash');
+server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+connection to server was lost
+
+-- prepared transactions on the data nodes:
+shard3  gsi_885_shard3_i
+shard5  gsi_885_shard5_i
+SELECT * FROM users WHERE id = 9000003
+ id | email | name 
+----+-------+------
+(0 rows)
+
+SELECT gsi_resolve(0)
+ gsi_resolve 
+-------------
+           2
+(1 row)
+
+SELECT * FROM users WHERE id = 9000003
+   id    |  email  | name  
+---------+---------+-------
+ 9000003 | crash@x | Crash
+(1 row)
+
+-- prepared transactions on the data nodes:
+(none)
+
+[Enter] next section 
+==================================================================
+ 4b. Coordinator crashes BEFORE the commit decision -> roll back
+==================================================================
+
+SET gsi.fail_point = 'after_prepare';
+SET
+INSERT INTO users VALUES (9000004, 'lost@x', 'Lost');
+server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+connection to server was lost
+
+-- prepared transactions on the data nodes:
+shard1  gsi_886_shard1_i
+shard3  gsi_886_shard3_i
+SELECT gsi_resolve(0)
+ gsi_resolve 
+-------------
+           2
+(1 row)
+
+SELECT * FROM users WHERE id = 9000004
+ id | email | name 
+----+-------+------
+(0 rows)
+
+-- prepared transactions on the data nodes:
+(none)

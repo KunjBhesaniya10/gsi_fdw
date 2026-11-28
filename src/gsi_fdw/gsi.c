@@ -161,13 +161,14 @@ gsi_load_nodes(int *nnodes, MemoryContext cxt)
 }
 
 /*
- * GsiIndex rows: name, column, unique, ready, async, type, collation, and
- * the row identifier (the partition key column, int2vector partattrs is
- * 0-based): name, type.  gsi_create admits only single-column keys.
+ * GsiIndex rows: name, column, unique, ready, async, type, collation, the
+ * row identifier's name and type (the partition key column; partattrs is
+ * 0-based and gsi_create admits only single-column keys), delete-only.
  */
 #define GSI_INDEX_COLUMNS \
 	"SELECT i.index_name, i.column_name, i.is_unique, i.status = 'ready', " \
-	"i.mode = 'async', a.atttypid, a.attcollation, p.attname, p.atttypid " \
+	"i.mode = 'async', a.atttypid, a.attcollation, p.attname, p.atttypid, " \
+	"i.status = 'delete-only' " \
 	"FROM gsi.gsi_index i JOIN pg_catalog.pg_attribute a " \
 	"ON a.attrelid = i.base_table AND a.attname = i.column_name " \
 	"JOIN pg_catalog.pg_partitioned_table pt ON pt.partrelid = i.base_table " \
@@ -178,9 +179,9 @@ gsi_load_nodes(int *nnodes, MemoryContext cxt)
  * Run sql, a query on gsi.gsi_index taking one parameter, and return a List
  * of GsiIndex (one per row) allocated in cxt.  Caller must be in SPI.
  *
- * The catalog is read with the latest snapshot (GetLatestSnapshot()), not the transaction's snapshot: 
- * a REPEATABLE READ writer must see an index whose build started after its
- * snapshot was taken, or its writes would skip that index (see gsi_build.c).
+ * The catalog is read with the latest snapshot, not the transaction's: a
+ * REPEATABLE READ writer must see an index whose build started after its
+ * snapshot, or its writes would skip that index (see gsi_build.c).
  * read_only is false so that SPI advances the command counter and rows
  * written earlier in this transaction are visible.
  */
@@ -221,6 +222,7 @@ read_indexes(const char *sql, Oid argtype, Datum arg, MemoryContext cxt)
 			idx->collid = DatumGetObjectId(SPI_getbinval(tup, desc, 7, &isnull));
 			idx->id_column = pstrdup(NameStr(*DatumGetName(SPI_getbinval(tup, desc, 8, &isnull))));
 			idx->id_typid = DatumGetObjectId(SPI_getbinval(tup, desc, 9, &isnull));
+			idx->is_delete_only = DatumGetBool(SPI_getbinval(tup, desc, 10, &isnull));
 			idx->remote_table = psprintf("public.%s",
 										 quote_identifier(psprintf("gsi_%s", idx->name)));
 			idx->servers = servers;
@@ -437,10 +439,10 @@ gsi_begin_modify(Relation rel, CmdType operation, Plan *subplan,
 		List	   *planned = NIL;
 
 		/*
-		 * Planned before a build's write-only catalog row existed: no junk
-		 * columns for that index.  This writer has held its lock since
-		 * planning, so gsi_create waits for it before backfilling and the
-		 * backfill covers its rows.  A ready index must be in the plan.
+		 * A plan made before a build's catalog row existed has no junk
+		 * columns for that index; skip it.  gsi_create waits for this write
+		 * before making the index write-only, so it can't orphan an entry,
+		 * and the backfill covers its rows.  A ready index must be planned.
 		 */
 		foreach(lc, indexes)
 		{
@@ -600,6 +602,47 @@ gsi_capture_row(List *states, CmdType operation,
 		capture_one(lfirst(lc), operation, slot, planSlot);
 }
 
+/*
+ * An index DELETE found no entry for (key, id).  During a build that is
+ * normal: none exists yet while the GSI is delete-only, or the backfill
+ * hasn't reached the row.  But the entry may also exist, committed after
+ * this node's REPEATABLE READ snapshot (e.g. by a backfill chunk), and must
+ * not be left behind.
+ *
+ * Tell the two apart by inserting the entry: ON CONFLICT DO NOTHING checks
+ * every committed entry and raises 40001 if the conflicting one is
+ * invisible to our snapshot.  If the insert goes in, the entry was absent;
+ * delete it again.  If it is skipped, a visible entry of another id holds a
+ * unique GSI's key, so ours is absent too.
+ */
+static void
+check_entry_absent(GsiModifyState *gs, PGconn *conn, const char *key, const char *id)
+{
+	const char *values[3] = {key, id, psprintf("%d", gs->base_node)};
+	char	   *sql = psprintf("INSERT INTO %s (key, id, shard) VALUES ($1, $2, $3) "
+							   "ON CONFLICT DO NOTHING", gs->idx->remote_table);
+	PGresult   *res;
+	bool		inserted;
+
+	if (!PQsendQueryParams(conn, sql, 3, NULL, values, NULL, NULL, 0))
+		pgfdw_report_error(ERROR, NULL, conn, false, sql);
+	res = pgfdw_get_result(conn, sql);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pgfdw_report_error(ERROR, res, conn, true, sql);
+	inserted = strcmp(PQcmdTuples(res), "1") == 0;
+	PQclear(res);
+	if (!inserted)
+		return;
+
+	sql = psprintf("DELETE FROM %s WHERE key = $1 AND id = $2", gs->idx->remote_table);
+	if (!PQsendQueryParams(conn, sql, 2, NULL, values, NULL, NULL, 0))
+		pgfdw_report_error(ERROR, NULL, conn, false, sql);
+	res = pgfdw_get_result(conn, sql);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pgfdw_report_error(ERROR, res, conn, true, sql);
+	PQclear(res);
+}
+
 /* Run one index statement on the node's connection, inside its remote xact. */
 static void
 send_index_op(GsiModifyState *gs, int node, const char *key, const char *id,
@@ -630,16 +673,11 @@ send_index_op(GsiModifyState *gs, int node, const char *key, const char *id,
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 		pgfdw_report_error(ERROR, res, conn, true, sql);
 
-	/*
-	 a missing delete would mean some other transaction is concurrently updating the same key with old snapshot
-	 */
 	if (!insert && strcmp(PQcmdTuples(res), "1") != 0)
 	{
 		PQclear(res);
-		ereport(ERROR,
-				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-				 errmsg("could not serialize access due to concurrent update of GSI \"%s\"",
-						gs->idx->name)));
+		check_entry_absent(gs, conn, key, id);
+		return;
 	}
 	PQclear(res);
 }
@@ -650,7 +688,7 @@ send_index_op(GsiModifyState *gs, int node, const char *key, const char *id,
  * may be NULL).
  */
 static void
-send_outbox_op(GsiModifyState *gs)
+send_outbox_op(GsiModifyState *gs, const char *new_key)
 {
 	UserMapping *user = GetUserMapping(GetUserId(), gs->idx->servers[gs->base_node]);
 	PGconn	   *conn = GetConnection(user, false, NULL);
@@ -661,8 +699,8 @@ send_outbox_op(GsiModifyState *gs)
 
 	values[0] = gs->idx->name;
 	values[1] = gs->old_key;
-	values[2] = gs->new_key;
-	values[3] = gs->new_key ? gs->new_id : gs->old_id;
+	values[2] = new_key;
+	values[3] = new_key ? gs->new_id : gs->old_id;
 
 	if (!PQsendQueryParams(conn, sql, 4, NULL, values, NULL, NULL, 0))
 		pgfdw_report_error(ERROR, NULL, conn, false, sql);
@@ -695,7 +733,10 @@ gsi_note_base_write(List *states, PGconn *conn)
 	gsi_note_async_write();
 }
 
-/* Apply the captured entries of every GSI after the base write succeeded. */
+/*
+ * Apply the captured entries of every GSI after the base write succeeded.
+ * A delete-only GSI (first phase of an online build) only loses entries.
+ */
 void
 gsi_apply_row(List *states)
 {
@@ -704,17 +745,18 @@ gsi_apply_row(List *states)
 	foreach(lc, states)
 	{
 		GsiModifyState *gs = lfirst(lc);
+		const char *new_key = gs->idx->is_delete_only ? NULL : gs->new_key;
 
 		if (gs->idx->is_async)
 		{
-			if (gs->old_key || gs->new_key)
-				send_outbox_op(gs);
+			if (gs->old_key || new_key)
+				send_outbox_op(gs, new_key);
 			continue;
 		}
 		if (gs->old_key)
 			send_index_op(gs, gs->old_node, gs->old_key, gs->old_id, false);
-		if (gs->new_key)
-			send_index_op(gs, gs->new_node, gs->new_key, gs->new_id, true);
+		if (new_key)
+			send_index_op(gs, gs->new_node, new_key, gs->new_id, true);
 	}
 }
 
